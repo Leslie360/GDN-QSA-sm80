@@ -267,6 +267,19 @@ __global__ void indexer_score_kernel(
     int q0 = qtile * SCORE_CQ;
     int b0 = btile * SCORE_CB;
 
+    // The causal mask hides every cell of a tile whose earliest block is not yet
+    // visible to its latest query (b0*r + r-1 > q0 + SCORE_CQ - 1).  Early query
+    // tiles are almost entirely invisible, so bail out here instead of staging
+    // the query/key tiles (global loads + barrier) just to write -inf.
+    if (b0 * r + (r - 1) > q0 + SCORE_CQ - 1) {
+        for (int i = threadIdx.x; i < SCORE_CQ * SCORE_CB; i += blockDim.x) {
+            int lq = i / SCORE_CB, lc = i % SCORE_CB;
+            int q = q0 + lq, blk = b0 + lc;
+            if (q < S && blk < NB) block_scores[(size_t)b * S * NB + (size_t)q * NB + blk] = -CUDART_INF_F;
+        }
+        return;
+    }
+
     // Stage the query tile [q0, q0+CQ) x [Hq, D] (float4).
     {
         const float4* src = qenc + ((size_t)b * S + q0) * HqD4;
@@ -312,7 +325,7 @@ __global__ void indexer_score_kernel(
             const float4* q1 = sh_q + (size_t)(rq * 4 + 1) * D4;
             const float4* q2 = sh_q + (size_t)(rq * 4 + 2) * D4;
             const float4* q3 = sh_q + (size_t)(rq * 4 + 3) * D4;
-            #pragma unroll 4
+            #pragma unroll 8
             for (int d = 0; d < D4; ++d) {
                 float k0 = kk[d * 4 + 0];
                 float k1 = kk[d * 4 + 1];
