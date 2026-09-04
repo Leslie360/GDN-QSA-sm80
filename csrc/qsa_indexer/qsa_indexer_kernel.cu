@@ -436,10 +436,14 @@ __global__ void indexer_topk_kernel(
 
     const float* scores = block_scores + (size_t)b * S * NB + (size_t)q * NB;
 
-    // Pack ALL NB candidates to FIXED positions (no atomics): valid keys packed
-    // as (sortable score, reversed index); invalid as NEG_INF_KEY, which the
-    // histogram/collect scans skip.  The old dense compaction used a single
-    // atomicAdd counter that every thread contended on (~0.1ms at S=8192).
+    // Pack ALL NB candidates to FIXED positions (no atomics) AND histogram their
+    // top byte in the same pass over the global scores: valid keys packed as
+    // (sortable score, reversed index), invalid as NEG_INF_KEY (the only float
+    // mapping to sortable 0x007FFFFF, so it never collides and the collect scan
+    // skips it).  The old dense compaction used a single contended atomicAdd,
+    // and this fusion drops one full s_pack pass + barrier.
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
+    __syncthreads();
     for (int i = threadIdx.x; i < NB; i += blockDim.x) {
         float s = scores[i];
         uint32_t sb = __float_as_uint(s);
@@ -447,19 +451,11 @@ __global__ void indexer_topk_kernel(
         if (s != -CUDART_INF_F) {
             uint32_t sortable = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
             pk = ((uint64_t)sortable << 32) | (uint64_t)(0xFFFFFFFFu - (uint32_t)i);
+            atomicAdd(&s_hist[(int)((pk >> 56) & 0xFFu)], 1);
         } else {
-            pk = NEG_INF_KEY;                       // sortable(-inf), skipped below
+            pk = NEG_INF_KEY;
         }
         s_pack[i] = pk;
-    }
-    __syncthreads();
-
-    // ---- round 1: histogram top 8 bits of the valid keys (skip -inf) ----
-    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
-    __syncthreads();
-    for (int i = threadIdx.x; i < NB; i += blockDim.x) {
-        uint64_t pk = s_pack[i];
-        if (pk != NEG_INF_KEY) atomicAdd(&s_hist[(int)((pk >> 56) & 0xFFu)], 1);
     }
     __syncthreads();
 
