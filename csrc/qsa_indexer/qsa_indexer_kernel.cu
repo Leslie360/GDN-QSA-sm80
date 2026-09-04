@@ -175,7 +175,7 @@ __global__ void indexer_encode_q_kernel(
 // bank -> eliminates the catastrophic 32-way bank conflict that a row stride
 // of D (a multiple of 32) would otherwise cause.
 // ---------------------------------------------------------------------------
-#define SCORE_CQ 8
+#define SCORE_CQ 16
 #define SCORE_CB 32
 
 __global__ void indexer_score_kernel(
@@ -643,7 +643,12 @@ std::vector<torch::Tensor> qsa_indexer_forward(
         int HqD4 = Hq * D4;
         int smem_bytes = SCORE_CQ * HqD4 * (int)sizeof(float4)
                        + SCORE_CB * (D + 1) * (int)sizeof(float);
-        TORCH_CHECK(smem_bytes <= 48 * 1024, "score kernel shared memory too large");
+        // Larger query tiles can push past the 48KB default; opt in (A800 max 164KB).
+        if (smem_bytes > 48 * 1024) {
+            cudaFuncSetAttribute(indexer_score_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem_bytes);
+        }
         dim3 grid((S + SCORE_CQ - 1) / SCORE_CQ,
                   (NB + SCORE_CB - 1) / SCORE_CB,
                   B);
