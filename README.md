@@ -1,6 +1,15 @@
 # gdn-qsa-sm80
 
-From-scratch **SM80 (A800) CUDA/CUTE** operators for the **Gated DeltaNet + Sparse Attention (QSA)** architecture family.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![tests](https://img.shields.io/badge/tests-33%2F33-brightgreen)](docs/VALIDATION_LOG.md)
+
+From-scratch **SM80 (A100/A800) CUDA/CUTE** kernels for the **GDN (Gated DeltaNet)**
+and **QSA (query-key sparse attention)** attention operators.
+
+Public implementations of this architecture family are mostly Triton kernels
+(e.g. fla), while first-class CUDA kernel libraries (FlashMLA, FlashKDA, …)
+target SM90+ — leaving the large installed base of A100/A800 (SM80) GPUs
+without hand-written CUDA kernels for GDN/QSA. This repo fills that gap.
 
 The kernels implement the compute core of modern open-weight GDN + QSA models
 (chunked gated delta-rule linear attention, block-level sparse indexer, sparse
@@ -11,6 +20,10 @@ kernels and reproducible benchmarks against public baselines.
 > **Status**: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (33/33 tests PASS).
+
+## News
+
+- **2026.09.04 · v0.1.0** — initial public release: all four operators shipped, 33/33 tests PASS, clean-A800 validation log.
 
 ## Scope
 
@@ -26,6 +39,7 @@ Deliberately **out of scope** for this repo:
 
 ## Highlights
 
+- **gdn_chunk up to 1.63× vs fla** (S=32K, bf16, A800); **qsa_core TC pass-2 1.5–1.7× vs scalar** — full reproduce commands in [Benchmarks](#benchmarks).
 - **From-scratch SM80 CUDA/CUTE** kernels (not Triton wrappers).
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
@@ -34,12 +48,12 @@ Deliberately **out of scope** for this repo:
 
 ## Supported operators
 
-| Operator | Component | Status |
-|---|---|---|
-| `gdn_chunk` | Gated DeltaNet (linear attention) | ✅ shipped |
-| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | ✅ shipped |
-| `output_gate` | Gated residual output gate | ✅ shipped |
-| `qsa_core` | QSA sparse-block attention | ✅ shipped (scalar + TC pass2) |
+| Operator | Component | Target | Dtypes | Notes |
+|---|---|---|---|---|
+| `gdn_chunk` | Gated DeltaNet (linear attention) | SM80 (A100/A800) | bf16 | serial / reset-fast-path / two-level scan, auto-dispatch by S |
+| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | SM80 | fp32 | short/medium S; S≥8192 bandwidth-bound (see [Benchmarks](#benchmarks)) |
+| `output_gate` | Gated residual output gate | SM80 | bf16 | RMSNormGated + CUTLASS GEMM |
+| `qsa_core` | QSA sparse-block attention | SM80 | scalar: all / TC: bf16 | TC pass-2 requires D=256 |
 
 Default benchmark shapes follow the public GDN+QSA architecture
 (GDN `Hq=16/Hv=32/D=128`, QSA `24Q/2KV/D=256`, bf16). Kernels are specialized
