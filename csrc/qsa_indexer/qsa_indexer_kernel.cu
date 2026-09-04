@@ -407,6 +407,11 @@ __global__ void indexer_score_kernel(
 //      instead of next_pow2(~K+epsilon) which was often 2x K.
 //   5. bitonic sort s_out[0..K_eff) descending -> exact reference order.
 // ---------------------------------------------------------------------------
+// Packed key for a -inf score: sortable(-inf) = 0x007FFFFF (the only float that
+// maps there), so valid keys can never collide with this sentinel and the
+// histogram/collect scans test `pk != NEG_INF_KEY` to skip invalid candidates.
+#define NEG_INF_KEY ((uint64_t)0x007FFFFFu << 32)
+
 __global__ void indexer_topk_kernel(
     const float* __restrict__ block_scores,   // [B,S,NB]
     int* __restrict__ block_indices,          // [B,S,KB]
@@ -425,53 +430,57 @@ __global__ void indexer_topk_kernel(
 
     const float* scores = block_scores + (size_t)b * S * NB + (size_t)q * NB;
 
-    // Compact valid (non -inf) candidates into shared memory, packed.
-    __shared__ int scount;
-    if (threadIdx.x == 0) scount = 0;
-    __syncthreads();
-
+    // Pack ALL NB candidates to FIXED positions (no atomics): valid keys packed
+    // as (sortable score, reversed index); invalid as NEG_INF_KEY, which the
+    // histogram/collect scans skip.  The old dense compaction used a single
+    // atomicAdd counter that every thread contended on (~0.1ms at S=8192).
     for (int i = threadIdx.x; i < NB; i += blockDim.x) {
         float s = scores[i];
+        uint32_t sb = __float_as_uint(s);
+        uint64_t pk;
         if (s != -CUDART_INF_F) {
-            int pos = atomicAdd(&scount, 1);
-            uint32_t sb = __float_as_uint(s);
             uint32_t sortable = (sb & 0x80000000u) ? ~sb : (sb | 0x80000000u);
-            s_pack[pos] = ((uint64_t)sortable << 32)
-                        | (uint64_t)(0xFFFFFFFFu - (uint32_t)i);
+            pk = ((uint64_t)sortable << 32) | (uint64_t)(0xFFFFFFFFu - (uint32_t)i);
+        } else {
+            pk = NEG_INF_KEY;                       // sortable(-inf), skipped below
         }
+        s_pack[i] = pk;
     }
     __syncthreads();
-    int P = scount;
-    int K_eff = std::min(KB, P);
+
+    // ---- round 1: histogram top 8 bits of the valid keys (skip -inf) ----
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < NB; i += blockDim.x) {
+        uint64_t pk = s_pack[i];
+        if (pk != NEG_INF_KEY) atomicAdd(&s_hist[(int)((pk >> 56) & 0xFFu)], 1);
+    }
+    __syncthreads();
+
+    // ---- find pivot (thread 0): P = total valid, K_eff = min(KB, P), b1 ----
+    __shared__ int K_eff, sb1, scnt_gt, sneed;
+    if (threadIdx.x == 0) {
+        int total = 0;
+        for (int b = 255; b >= 0; --b) total += s_hist[b];
+        int k = std::min(KB, total);
+        int cnt = 0, need = k, b1 = 0;
+        for (int b = 255; b >= 0; --b) {
+            int c = s_hist[b];
+            if (cnt + c >= k) { b1 = b; need = k - cnt; break; }
+            cnt += c;
+        }
+        K_eff = k; sb1 = b1; scnt_gt = cnt; sneed = need;
+    }
+    __syncthreads();
 
     if (K_eff > 0) {
-        // ---- round 1: histogram top 8 bits of the valid keys ----
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
-        __syncthreads();
-        for (int i = threadIdx.x; i < P; i += blockDim.x) {
-            atomicAdd(&s_hist[(int)((s_pack[i] >> 56) & 0xFFu)], 1);
-        }
-        __syncthreads();
-
-        // ---- find pivot: walk digits high->low, accumulate >b1 count ----
-        __shared__ int sb1, scnt_gt, sneed;
-        if (threadIdx.x == 0) {
-            int cnt = 0, need = K_eff, b1 = 0;
-            for (int b = 255; b >= 0; --b) {
-                int c = s_hist[b];
-                if (cnt + c >= K_eff) { b1 = b; need = K_eff - cnt; break; }
-                cnt += c;
-            }
-            sb1 = b1; scnt_gt = cnt; sneed = need;
-        }
-        __syncthreads();
-
-        // ---- collect: >b1 -> s_out head; ==b1 -> s_eq (reuse s_pack) ----
+        // ---- collect: >b1 -> s_out head; ==b1 -> s_eq (in-place into s_pack) ----
         __shared__ int sgt_cnt, seq_cnt;
         if (threadIdx.x == 0) { sgt_cnt = 0; seq_cnt = 0; }
         __syncthreads();
-        for (int i = threadIdx.x; i < P; i += blockDim.x) {
+        for (int i = threadIdx.x; i < NB; i += blockDim.x) {
             uint64_t pk = s_pack[i];
+            if (pk == NEG_INF_KEY) continue;
             int d = (int)((pk >> 56) & 0xFFu);
             if (d > sb1) {
                 s_out[atomicAdd(&sgt_cnt, 1)] = pk;
