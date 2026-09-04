@@ -1,12 +1,16 @@
 # gdn-qsa-sm80
 
-Standalone **SM80 (A800) CUDA operators** for the **Gated DeltaNet + Sparse Attention (QSA)** architecture family, from scratch.
+From-scratch **SM80 (A800) CUDA/CUTE** operators for the **Gated DeltaNet + Sparse Attention (QSA)** architecture family.
 
-Optimized for modern open-weight GDN + QSA models on SM80/A800.
+The kernels implement the compute core of modern open-weight GDN + QSA models
+(chunked gated delta-rule linear attention, block-level sparse indexer, sparse
+core attention, and the gated output projection) — written from scratch for
+A800 (compute capability 8.0), with tensor-core `mma.sync` + `cp.async`
+kernels and reproducible benchmarks against public baselines.
 
-> Status: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
+> **Status**: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
 >
-> Validation: clean-A800 build/test/bench record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md).
+> **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (33/33 tests PASS).
 
 ## Scope
 
@@ -26,6 +30,7 @@ Deliberately **out of scope** for this repo:
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
 - Numeric correctness policy documented in [`docs/CORRECTNESS_POLICY.md`](docs/CORRECTNESS_POLICY.md).
+- `qsa_core` ships a scalar path (all dtypes) **and** a tensor-core pass-2 (v3) path.
 
 ## Supported operators
 
@@ -40,6 +45,23 @@ Default benchmark shapes follow the public GDN+QSA architecture
 (GDN `Hq=16/Hv=32/D=128`, QSA `24Q/2KV/D=256`, bf16). Kernels are specialized
 for the published head dimensions and SM80, not locked to any single model.
 
+## Repository layout
+
+```
+csrc/                CUDA/C++ sources, one dir per operator
+  gdn_chunk/         Gated DeltaNet: prepare / stage1 / stage2 / stage3 + host wrapper
+  qsa_indexer/       block-level MQA indexer (kernel + pybind)
+  output_gate/       RMSNormGated + out_proj (self-written + CUTLASS GEMM)
+  qsa_core/          sparse core attention (scalar) + TC pass-2 (v3)
+gdn_qsa_sm80/        Python package: per-op functional API + torch references
+  reference/         pure-torch correctness anchors
+tests/               pytest, one file per operator (33 tests)
+benchmarks/          per-op benchmark scripts (bench_<op>.py)
+docs/                per-op notes, methodology, correctness policy, validation log
+third_party/         vendored CUTLASS/CuTe headers (BSD-3-Clause)
+scripts/             build.sh / verify_all.sh / bench_all.sh
+```
+
 ## Install
 
 Source build only (no wheels provided):
@@ -52,6 +74,22 @@ pip install -e . --no-build-isolation
 Requires: CUDA ≥ 12.0, `sm_80` target (A800), PyTorch with CUDA, and a C++17
 compiler. The extension is compiled in-place; `gdn_qsa_sm80.*_cuda` `.so` files
 appear under the package after a successful build.
+
+To build only a subset of operators:
+
+```bash
+GDN_QSA_BUILD_OPS=gdn_chunk,qsa_core bash scripts/build.sh
+# or legacy alias: GDN_QSA_BUILD_GDN_ONLY=1 bash scripts/build.sh
+```
+
+## Testing & benchmarks
+
+Run on a clean A800 (`CUDA_VISIBLE_DEVICES=0`):
+
+```bash
+bash scripts/verify_all.sh   # correctness gate: pytest tests/ -x
+bash scripts/bench_all.sh    # gate + all four benchmark tables
+```
 
 ## Usage
 
@@ -168,11 +206,30 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
 All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md).
 
+## Roadmap
+
+- `qsa_indexer` long-sequence (`S=8192+`) is bandwidth-bound and slower than a
+  vectorized eager baseline; a split-K score path is planned.
+- `qsa_core` TC pass-2 is a documented ~1.5x win over scalar; further gains are
+  expected from a fused pass-1+pass-2 kernel.
+- `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
+  (see Scope).
+
 ## Related work
 
-- `flashmla-sm80`: an SM80 FlashMLA decode optimization, maintained separately.
-- Baseline references: [fla](https://github.com/fla-org/flash-linear-attention).
+- [fla](https://github.com/fla-org/flash-linear-attention) — public baseline for
+  the GDN benchmark; kernel implementations here are independent.
+- `flashmla-sm80` — an SM80 FlashMLA decode optimization, maintained separately.
+- [NVIDIA/CUTLASS](https://github.com/NVIDIA/cutlass) — CuTe/CUTLASS headers
+  vendored under `third_party/cutlass` (BSD-3-Clause).
+
+## Acknowledgements
+
+Built on lessons from hand-optimizing GDN/QSA-family kernels for SM80 (two-level
+scan, tensor-core QK/PV, bank-conflict-free layouts). Thanks to the fla and
+CUTLASS communities for public baselines and primitives.
 
 ## License
 
-[Apache-2.0](LICENSE). `third_party/` retains its own licenses.
+[Apache-2.0](LICENSE). `third_party/` retains its own licenses
+(`third_party/cutlass/LICENSE`, BSD-3-Clause).
