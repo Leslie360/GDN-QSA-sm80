@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "torch", "ninja"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gdn-qsa-sm80"
+version = "0.1.0"
+description = "From-scratch SM80 (A800) CUDA operators for Gated DeltaNet + Sparse Attention"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "gdn-qsa-sm80 contributors" }]
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+benchmark = ["matplotlib", "pandas"]
+
+[tool.setuptools]
+packages = ["gdn_qsa_sm80"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

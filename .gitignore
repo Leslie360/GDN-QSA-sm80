@@ -1,0 +1,22 @@
+# build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+*.pyc
+__pycache__/
+
+# ninja / torch extension
+.ninja_*
+*.ninja_log
+*.ninja_deps
+
+# editor / misc
+.vscode/
+.idea/
+*.swp
+
+# benchmark scratch
+benchmarks/_out/
