@@ -18,6 +18,7 @@ from .qsa_core_interface import (
 from .qsa_indexer_interface import (
     qsa_indexer,
     qsa_indexer_reference,
+    qsa_indexer_topk_only,
 )
 
 __version__ = "0.1.0"
@@ -28,6 +29,7 @@ __all__ = [
     "gdn_chunk_reference",
     # QSA indexer
     "qsa_indexer",
+    "qsa_indexer_topk_only",
     "qsa_indexer_reference",
     # QSA sparse-core attention
     "qsa_sparse_core_attention",

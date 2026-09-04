@@ -13,7 +13,7 @@ import time
 
 import torch
 
-from gdn_qsa_sm80 import qsa_indexer
+from gdn_qsa_sm80 import qsa_indexer, qsa_indexer_topk_only
 from gdn_qsa_sm80.reference.qsa_indexer_ref import make_rope_tables
 
 
@@ -71,7 +71,7 @@ def _eager_indexer(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, block_topk):
 def main():
     Hq, D, R, r, KB = 4, 128, 64, 4, 512
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print("S        ours(ms)  eager(ms)  speedup")
+    print("S        ours(ms)  fused(ms)  eager(ms)  vs-full   vs-eager(fused)")
     for S in (512, 2048, 8192):
         torch.manual_seed(0)
         q = torch.randn(1, S, Hq, D, dtype=torch.float32, device="cuda") * 0.5
@@ -80,8 +80,10 @@ def main():
         cos_k, sin_k = make_rope_tables(1, S, R, device="cuda")
 
         ours = _timed(qsa_indexer, q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, KB)
+        fused = _timed(qsa_indexer_topk_only, q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, KB)
         eager_ms = _timed(_eager_indexer, q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, KB)
-        print(f"{S:>6}  {ours:8.3f}  {eager_ms:8.3f}  {eager_ms/ours:6.2f}x")
+        print(f"{S:>6}  {ours:8.3f}  {fused:8.3f}  {eager_ms:8.3f}  "
+              f"{ours/fused:7.2f}x  {eager_ms/fused:10.2f}x")
 
 
 if __name__ == "__main__":

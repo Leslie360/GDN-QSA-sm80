@@ -9,7 +9,7 @@ import torch
 
 from . import _qsa_indexer
 
-__all__ = ["qsa_indexer", "qsa_indexer_reference"]
+__all__ = ["qsa_indexer", "qsa_indexer_topk_only", "qsa_indexer_reference"]
 
 
 def qsa_indexer(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512):
@@ -33,6 +33,33 @@ def qsa_indexer(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512):
     )
     fn = getattr(_qsa_indexer, "qsa_indexer_forward", None) or getattr(_qsa_indexer, "forward")
     return fn(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, block_topk)
+
+
+def qsa_indexer_topk_only(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512):
+    """Block-level MQA indexer — fused topK-only fast path.
+
+    Same math as :func:`qsa_indexer`, but the dense [B, S, NB] ``block_scores``
+    matrix is never materialized: each query's block scores are computed and
+    selected straight into the TopK buffer inside a single fused kernel.  This
+    drops the 64MB dense-score write+read at long sequences and is the
+    production fast path.
+
+    Args:
+        q: [B, S, Hq, D] float32 — query states (MQA, Hq query heads).
+        raw_keys: [B, S, D] float32 — raw key states (1 shared key head, pre-compression).
+        cos_q/sin_q: [B, S, R] float32 — rotary for query token positions.
+        cos_k/sin_k: [B, S, R] float32 — rotary for block start positions.
+        r: compression ratio (default 4).
+        block_topk: KB = token_budget // r (default 512).
+
+    Returns:
+        block_indices: [B, S, KB] int32 — selected block indices (-1 padded).
+        selected_scores: [B, S, KB] float32 — scores of selected blocks (-inf padded).
+    """
+    q, raw_keys, cos_q, sin_q, cos_k, sin_k = (
+        x.contiguous() for x in (q, raw_keys, cos_q, sin_q, cos_k, sin_k)
+    )
+    return _qsa_indexer.qsa_indexer_topk_only(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r, block_topk)
 
 
 def qsa_indexer_reference(q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512):
