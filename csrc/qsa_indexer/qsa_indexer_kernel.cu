@@ -232,19 +232,49 @@ __global__ void indexer_score_kernel(
     float score = -CUDART_INF_F;
     if (visible && inb) {
         const float* kk = sh_kf + (size_t)c * (D + 1);
-        float acc = 0.0f;
-        for (int h = 0; h < Hq; ++h) {
-            const float4* qh = sh_q + (size_t)(rq * Hq + h) * D4;
-            float dot = 0.0f;
+        if (Hq == 4) {
+            // Loop exchange (Hq=4 fast path): each block-key element is read from
+            // shared memory ONCE per dim and reused across the 4 query heads —
+            // the h-outer form re-reads kk[] Hq times (4x redundant smem reads).
+            // Per-head accumulators are needed because ReLU is applied per head.
+            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            const float4* q0 = sh_q + (size_t)(rq * 4 + 0) * D4;
+            const float4* q1 = sh_q + (size_t)(rq * 4 + 1) * D4;
+            const float4* q2 = sh_q + (size_t)(rq * 4 + 2) * D4;
+            const float4* q3 = sh_q + (size_t)(rq * 4 + 3) * D4;
             #pragma unroll 4
             for (int d = 0; d < D4; ++d) {
-                float4 a = qh[d];
-                dot += a.x * kk[d * 4 + 0] + a.y * kk[d * 4 + 1]
-                     + a.z * kk[d * 4 + 2] + a.w * kk[d * 4 + 3];
+                float k0 = kk[d * 4 + 0];
+                float k1 = kk[d * 4 + 1];
+                float k2 = kk[d * 4 + 2];
+                float k3 = kk[d * 4 + 3];
+                float4 a0 = q0[d], a1 = q1[d], a2 = q2[d], a3 = q3[d];
+                d0 += a0.x * k0 + a0.y * k1 + a0.z * k2 + a0.w * k3;
+                d1 += a1.x * k0 + a1.y * k1 + a1.z * k2 + a1.w * k3;
+                d2 += a2.x * k0 + a2.y * k1 + a2.z * k2 + a2.w * k3;
+                d3 += a3.x * k0 + a3.y * k1 + a3.z * k2 + a3.w * k3;
             }
-            if (dot > 0.0f) acc += dot;   // ReLU
+            float acc = 0.0f;
+            if (d0 > 0.0f) acc += d0;   // ReLU per head
+            if (d1 > 0.0f) acc += d1;
+            if (d2 > 0.0f) acc += d2;
+            if (d3 > 0.0f) acc += d3;
+            score = acc * rsqrtf_((float)D);
+        } else {
+            float acc = 0.0f;
+            for (int h = 0; h < Hq; ++h) {
+                const float4* qh = sh_q + (size_t)(rq * Hq + h) * D4;
+                float dot = 0.0f;
+                #pragma unroll 4
+                for (int d = 0; d < D4; ++d) {
+                    float4 a = qh[d];
+                    dot += a.x * kk[d * 4 + 0] + a.y * kk[d * 4 + 1]
+                         + a.z * kk[d * 4 + 2] + a.w * kk[d * 4 + 3];
+                }
+                if (dot > 0.0f) acc += dot;   // ReLU
+            }
+            score = acc * rsqrtf_((float)D);
         }
-        score = acc * rsqrtf_((float)D);
     }
     if (inb) block_scores[(size_t)b * S * NB + (size_t)q * NB + blk] = score;
 }
