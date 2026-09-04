@@ -61,8 +61,13 @@ __device__ __forceinline__ float rsqrtf_(float x) {
 // ---------------------------------------------------------------------------
 // Kernel A: compress raw keys into pooled, RMSNorm'd, partially-roped block keys.
 //   kbar[B, NB, D]  where NB = S / r.
-// One thread per (batch, block).  Pool = mean over r tokens, RMSNorm over D,
-// partial RoPE (first R dims) at block-start position p_b = blk * r.
+// One WARP per (batch, block): lane dg owns the float4 at dims [4dg, 4dg+4),
+// which coalesces the r-token loads across the warp (the old thread-per-block
+// version read rows strided r*D floats apart -> ~2% coalescing, and with only
+// B*NB threads the GPU was nearly idle at S=8192).  Pool = mean over r tokens,
+// RMSNorm via a 32-lane warp reduction, partial RoPE (first R dims) at block
+// start p_b = blk * r with a __shfl_xor pair exchange.  D=128, R=64 enforced
+// by the host (production indexer shapes).
 // ---------------------------------------------------------------------------
 __global__ void indexer_pool_keys_kernel(
     const float* __restrict__ raw_keys,   // [B,S,D]
@@ -71,45 +76,70 @@ __global__ void indexer_pool_keys_kernel(
     float* __restrict__ kbar,             // [B,NB,D]
     int B, int S, int D, int R, int r, int NB)
 {
+    const int D4 = D / 4;                 // 32 for D=128
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * NB;
+    int total = B * NB * D4;
     if (idx >= total) return;
 
-    int blk = idx % NB;
-    int b   = idx / NB;
+    int dg = idx % D4;                    // dim group (lane)
+    int bb = idx / D4;                    // b*NB + blk
+    int blk = bb % NB;
+    int b   = bb / NB;
     int p_b = blk * r;
 
-    const float* kb = raw_keys + (size_t)b * S * D;
+    const float4* k4 = reinterpret_cast<const float4*>(raw_keys + (size_t)b * S * D);
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    #pragma unroll
+    for (int u = 0; u < r; ++u) {
+        float4 v = k4[(size_t)(p_b + u) * D4 + dg];
+        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+    }
+    float inv = 1.0f / (float)r;
+    float4 pooled = make_float4(acc.x * inv, acc.y * inv,
+                                acc.z * inv, acc.w * inv);
 
-    // AvgPool over r tokens -> pooled block key
-    float local[128];   // D <= 128
-    for (int d = 0; d < D; ++d) {
-        float acc = 0.0f;
-        for (int u = 0; u < r; ++u) acc += kb[(size_t)(p_b + u) * D + d];
-        local[d] = acc * (1.0f / (float)r);
+    // RMSNorm over D (warp reduce over the 32 dim groups)
+    float ssum = pooled.x * pooled.x + pooled.y * pooled.y
+               + pooled.z * pooled.z + pooled.w * pooled.w;
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 16);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 8);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 4);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 2);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 1);
+    float rms_inv = rsqrtf_(ssum / (float)D + 1e-6f);
+    float4 out = make_float4(pooled.x * rms_inv, pooled.y * rms_inv,
+                             pooled.z * rms_inv, pooled.w * rms_inv);
+
+    // partial RoPE at block start p_b (R=64: pairs (d, d+32), partner 8 lanes off)
+    if (dg < 16) {
+        float4 partner;
+        partner.x = __shfl_xor_sync(0xFFFFFFFFu, out.x, 8);
+        partner.y = __shfl_xor_sync(0xFFFFFFFFu, out.y, 8);
+        partner.z = __shfl_xor_sync(0xFFFFFFFFu, out.z, 8);
+        partner.w = __shfl_xor_sync(0xFFFFFFFFu, out.w, 8);
+        int m = dg & 7;                   // cos/sin pair index
+        const float4* c4 = reinterpret_cast<const float4*>(cos_k)
+                         + ((size_t)b * S + p_b) * (R / 4) + m;
+        const float4* s4 = reinterpret_cast<const float4*>(sin_k)
+                         + ((size_t)b * S + p_b) * (R / 4) + m;
+        float4 co = c4[0], si = s4[0];
+        if (dg < 8) {
+            // first half: new[d]       = x[d]*c - x[d+32]*s
+            out.x = out.x * co.x - partner.x * si.x;
+            out.y = out.y * co.y - partner.y * si.y;
+            out.z = out.z * co.z - partner.z * si.z;
+            out.w = out.w * co.w - partner.w * si.w;
+        } else {
+            // second half: new[d+32]   = x[d]*s + x[d+32]*c
+            out.x = partner.x * si.x + out.x * co.x;
+            out.y = partner.y * si.y + out.y * co.y;
+            out.z = partner.z * si.z + out.z * co.z;
+            out.w = partner.w * si.w + out.w * co.w;
+        }
     }
 
-    // RMSNorm over D
-    float mean_sq = 0.0f;
-    for (int d = 0; d < D; ++d) mean_sq += local[d] * local[d];
-    mean_sq /= (float)D;
-    float rms_inv = rsqrtf_(mean_sq + 1e-6f);
-    for (int d = 0; d < D; ++d) local[d] *= rms_inv;
-
-    // partial RoPE at block start p_b
-    const float* cbp = cos_k + (size_t)b * S * R + (size_t)p_b * R;
-    const float* sbp = sin_k + (size_t)b * S * R + (size_t)p_b * R;
-    for (int d = 0; d < R / 2; ++d) {
-        float x0 = local[d];
-        float x1 = local[d + R / 2];
-        float co = cbp[d];
-        float si = sbp[d];
-        local[d]         = x0 * co - x1 * si;
-        local[d + R / 2] = x0 * si + x1 * co;
-    }
-
-    float* out = kbar + (size_t)b * NB * D + (size_t)blk * D;
-    for (int d = 0; d < D; ++d) out[d] = local[d];
+    float4* o4 = reinterpret_cast<float4*>(kbar + (size_t)(b * NB + blk) * D);
+    o4[dg] = out;
 }
 
 // ---------------------------------------------------------------------------
@@ -804,8 +834,8 @@ std::vector<torch::Tensor> qsa_indexer_forward(
 
     // Kernel A: pool + norm + rope block keys
     {
-        int total = B * NB;
-        int threads = 128;
+        int total = B * NB * (D / 4);
+        int threads = 256;
         int blocks = (total + threads - 1) / threads;
         indexer_pool_keys_kernel<<<blocks, threads, 0, stream>>>(
             raw_keys.data_ptr<float>(),
@@ -929,8 +959,8 @@ std::vector<torch::Tensor> qsa_indexer_topk_only_forward(
 
     // Kernel A: pool + norm + rope block keys
     {
-        int total = B * NB;
-        int threads = 128;
+        int total = B * NB * (D / 4);
+        int threads = 256;
         int blocks = (total + threads - 1) / threads;
         indexer_pool_keys_kernel<<<blocks, threads, 0, stream>>>(
             raw_keys.data_ptr<float>(),
