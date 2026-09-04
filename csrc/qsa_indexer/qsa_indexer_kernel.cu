@@ -245,7 +245,7 @@ __global__ void indexer_encode_q_kernel(
 // bank -> eliminates the catastrophic 32-way bank conflict that a row stride
 // of D (a multiple of 32) would otherwise cause.
 // ---------------------------------------------------------------------------
-#define SCORE_CQ 16
+#define SCORE_CQ 8
 #define SCORE_CB 32
 
 __global__ void indexer_score_kernel(
