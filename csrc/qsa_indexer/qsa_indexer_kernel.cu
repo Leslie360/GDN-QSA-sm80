@@ -250,6 +250,7 @@ __global__ void indexer_score_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Kernel D: per-query TopK via a shared-memory bitonic merge sort (ascending),
 // then take the largest KB.  Works for ANY n_blocks (no fixed 512-slot buffer).
 // Grid: one thread block per (batch, query).
@@ -297,14 +298,20 @@ __global__ void indexer_topk_kernel(
     }
     __syncthreads();
 
-    // Bitonic merge sort, ascending.  To reproduce the reference's TopK tie
-    // breaking (the standalone reference and the original kernel both select
-    // the LOWEST block index among exactly-equal scores), equal scores are
-    // ordered so that the lower index is treated as "greater" and sorts toward
-    // the selected (high) end.
-    for (int k = 2; k <= P_pad; k <<= 1) {
+    // Sort only the P2 = next_pow2(P) window that actually holds valid entries.
+    // P (visible blocks for this query) is usually far below NB, so sorting the
+    // full P_pad is wasted work: e.g. query q sees ~q/r blocks, average ~NB/2.
+    // The remaining [P, P2) slots are -inf and sort to the front (never selected).
+    int P2 = 1;
+    while (P2 < P) P2 <<= 1;
+
+    // Bitonic merge sort (ascending) over the P2 window.  To reproduce the
+    // reference's TopK tie breaking (lowest block index among equal scores wins),
+    // equal scores are ordered so that the lower index is treated as "greater"
+    // and sorts toward the selected (high) end.
+    for (int k = 2; k <= P2; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = threadIdx.x; i < P_pad; i += blockDim.x) {
+            for (int i = threadIdx.x; i < P2; i += blockDim.x) {
                 int l = i ^ j;
                 if (l > i) {
                     bool up = ((i & k) == 0);
@@ -332,8 +339,8 @@ __global__ void indexer_topk_kernel(
     float* sels = selected_scores + (size_t)bq * KB;
     for (int j = threadIdx.x; j < KB; j += blockDim.x) {
         if (j < k) {
-            inds[j] = s_idx[P_pad - 1 - j];
-            sels[j] = s_score[P_pad - 1 - j];
+            inds[j] = s_idx[P2 - 1 - j];
+            sels[j] = s_score[P2 - 1 - j];
         } else {
             inds[j] = -1;
             sels[j] = -CUDART_INF_F;
@@ -412,7 +419,10 @@ std::vector<torch::Tensor> qsa_indexer_forward(
     CHECK_LAUNCH("encode_q");
     }
 
-    // Kernel C: score matrix (tiled; grid = (S/CQ) x (NB/CB) x B)
+    // Kernel C: score matrix (tiled).  Scalar float4-dot kernel (fp32-exact).
+    // A tensor-core (tf32 mma) variant was prototyped but measured slower than
+    // the scalar kernel at production shapes (m16n8k8 tf32 load+convert cost
+    // dominated the mma), so the scalar path is kept for all shapes.
     {
         int D4 = D / 4;
         int HqD4 = Hq * D4;
