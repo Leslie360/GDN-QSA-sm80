@@ -35,18 +35,47 @@ def pack(score, idx):
     return (hi << 32) | lo
 
 
+def msd_radix_sort_desc(arr):
+    """In-place MSD radix sort (8 bits/pass) on an integer array, DESCENDING.
+
+    The CUDA kernel sorts the ~K collected winners with exactly this scheme:
+    per pass, histogram the current byte, exclusive-prefix-scan the 256 buckets,
+    and scatter each element to base_desc[d] = tot - prefix[d+1] (descending),
+    keeping a running per-bucket counter for stability.  8 passes over the 64-bit
+    key => the output is the exact packed-desc total order (score desc, then
+    reversed-index desc == lowest block index first).  O(K*8) vs bitonic O(K log^2
+    K) — this is the CUB-style multi-pass radix that replaces the winner sort.
+    """
+    arr = arr.astype(np.uint64).copy()
+    n = len(arr)
+    tmp = np.empty_like(arr)
+    src, dst = arr, tmp
+    for p in range(8):
+        shift = 8 * p          # LSB -> MSB (LSD stable counting sort)
+        d = (src >> shift).astype(np.int64) & 0xFF
+        hist = np.bincount(d, minlength=256)
+        prefix = np.zeros(257, dtype=np.int64)   # prefix[d] = #(digit < d); prefix[256]=n
+        s = 0
+        for b in range(256):
+            prefix[b] = s
+            s += int(hist[b])
+        prefix[256] = s
+        run = np.zeros(256, dtype=np.int64)
+        for i in range(n):
+            dd = int(d[i])
+            pos = (n - int(prefix[dd + 1])) + int(run[dd])  # descending block base
+            dst[pos] = src[i]
+            run[dd] += 1
+        src, dst = dst, src
+    return src
+
+
 def radix_select_topk(packed, K):
     """Return indices (0..P-1 into the compacted array) of the top-K, DESC by key.
 
-    Single-round radix + exact sort of the pivot bucket:
-      1. histogram the top 8 bits (bits 63..56) of the packed key
-      2. pivot b1 = first digit whose running count reaches K; cnt_gt = #(>b1),
-         need = K - cnt_gt
-      3. >b1 candidates go (unordered) to out; ==b1 candidates go to eq
-      4. sort eq DESC (tiny for uniform data, large only in degenerate tie cases)
-         and take its top `need` -> append to out
-      5. out has exactly K winners, but >b1 were not mutually ordered: sort out DESC
-         -> exact packed-desc total order.
+    Single-round radix to collect the ~K winners, then MSD radix sort (instead of
+    bitonic) to order them — this is the current kernel D structure with the
+    winner sort swapped from bitonic to multi-pass radix.
     """
     n = len(packed)
     K = min(K, n)
@@ -67,12 +96,10 @@ def radix_select_topk(packed, K):
 
     gt = packed[d1 > b1]
     eq = packed[d1 == b1]
-    # sort eq desc and take its top `need`
-    eq_sorted = np.sort(eq)[::-1][:need]
-    out = np.concatenate([gt, eq_sorted])
-    out = np.sort(out)[::-1]          # final exact order of the K winners
+    eq_sorted = msd_radix_sort_desc(eq)[:need]
+    out = msd_radix_sort_desc(np.concatenate([gt, eq_sorted]))[:K]
     lookup = {int(v): i for i, v in enumerate(packed)}
-    return np.array([lookup[int(v)] for v in out[:K]], dtype=np.int64)
+    return np.array([lookup[int(v)] for v in out], dtype=np.int64)
 
 
 def reference_topk(packed, K):

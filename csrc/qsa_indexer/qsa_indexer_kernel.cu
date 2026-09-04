@@ -281,8 +281,9 @@ __global__ void indexer_score_kernel(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Kernel D: per-query TopK via a one-round RADIX select + bitonic sort of the
-// ~K winners (replaces a full O(P log^2 P) bitonic sort of all P2 candidates).
+// Kernel D: per-query TopK via a TWO-ROUND RADIX select + bitonic sort of
+// EXACTLY K winners (replaces a full O(P log^2 P) bitonic sort of all P2
+// candidates, and avoids padding a ~K+epsilon winner set up to P2 = 2*K).
 //
 // Grid: one thread block per (batch, query).
 // Dynamic shared memory: 2 * P_pad * sizeof(uint64) + 256 * sizeof(int).
@@ -299,10 +300,12 @@ __global__ void indexer_score_kernel(
 //   1. histogram the top 8 bits (bits 63..56) of the valid packed keys
 //   2. walk digits high->low accumulating counts; pivot b1 = first digit whose
 //      running count reaches K_eff; cnt_gt = #(>b1); need = K_eff - cnt_gt
-//   3. collect >b1 -> s_out[0..cnt_gt) (unordered) and ==b1 -> s_out[cnt_gt..)
-//      (shared-memory atomic counters); total written = cnt_gt + hist[b1] >= K
-//   4. bitonic sort s_out[0..tot) descending (tot ~= K for uniform data, never
-//      more than P2) and take the head K_eff.  This is the exact order.
+//   3. collect >b1 -> s_out[0..cnt_gt) and ==b1 -> s_eq (s_pack region)
+//   4. round 2: sort s_eq descending (it is only hist[b1] ~ P/256 elements for
+//      uniform data) and take its top `need` -> append after cnt_gt.  Now the
+//      winner set is EXACTLY K_eff, so the final bitonic runs on P2s=next_pow2(K)
+//      instead of next_pow2(~K+epsilon) which was often 2x K.
+//   5. bitonic sort s_out[0..K_eff) descending -> exact reference order.
 // ---------------------------------------------------------------------------
 __global__ void indexer_topk_kernel(
     const float* __restrict__ block_scores,   // [B,S,NB]
@@ -311,7 +314,7 @@ __global__ void indexer_topk_kernel(
     int B, int S, int NB, int KB, int P_pad)
 {
     extern __shared__ char smem_raw[];
-    uint64_t* s_pack = reinterpret_cast<uint64_t*>(smem_raw);   // P_pad
+    uint64_t* s_pack = reinterpret_cast<uint64_t*>(smem_raw);   // P_pad (reused as s_eq in round 2)
     uint64_t* s_out  = reinterpret_cast<uint64_t*>(smem_raw + (size_t)P_pad * sizeof(uint64_t)); // P_pad
     int* s_hist = reinterpret_cast<int*>(smem_raw + (size_t)2 * P_pad * sizeof(uint64_t));       // 256
 
@@ -363,7 +366,7 @@ __global__ void indexer_topk_kernel(
         }
         __syncthreads();
 
-        // ---- collect: >b1 to head, ==b1 after it ----
+        // ---- collect: >b1 -> s_out head; ==b1 -> s_eq (reuse s_pack) ----
         __shared__ int sgt_cnt, seq_cnt;
         if (threadIdx.x == 0) { sgt_cnt = 0; seq_cnt = 0; }
         __syncthreads();
@@ -373,16 +376,47 @@ __global__ void indexer_topk_kernel(
             if (d > sb1) {
                 s_out[atomicAdd(&sgt_cnt, 1)] = pk;
             } else if (d == sb1) {
-                s_out[scnt_gt + atomicAdd(&seq_cnt, 1)] = pk;
+                s_pack[atomicAdd(&seq_cnt, 1)] = pk;   // s_eq in-place
             }
         }
         __syncthreads();
-        int tot = scnt_gt + seq_cnt;   // >= K_eff by pivot construction
 
-        // ---- bitonic sort (descending) of the ~K winners ----
+        // ---- round 2: sort the ==b1 slab, keep top `need` ----
+        // (hist[b1] is tiny for uniform data, so this is a cheap exact sort.)
+        int eq_n = seq_cnt;
+        int P2e = 1;
+        while (P2e < eq_n) P2e <<= 1;
+        for (int i = eq_n + threadIdx.x; i < P2e; i += blockDim.x) {
+            s_pack[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
+        }
+        __syncthreads();
+        for (int k = 2; k <= P2e; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                for (int i = threadIdx.x; i < P2e; i += blockDim.x) {
+                    int l = i ^ j;
+                    if (l > i) {
+                        bool up = ((i & k) == 0);
+                        uint64_t a = s_pack[i];
+                        uint64_t b = s_pack[l];
+                        if ((up && a < b) || (!up && b < a)) {
+                            s_pack[i] = b;
+                            s_pack[l] = a;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        // append the top `need` of the sorted slab after the >b1 winners
+        for (int j = threadIdx.x; j < sneed; j += blockDim.x) {
+            s_out[scnt_gt + j] = s_pack[j];
+        }
+        __syncthreads();
+
+        // ---- bitonic sort (descending) of the EXACTLY K_eff winners ----
         int P2s = 1;
-        while (P2s < tot) P2s <<= 1;
-        for (int i = tot + threadIdx.x; i < P2s; i += blockDim.x) {
+        while (P2s < K_eff) P2s <<= 1;
+        for (int i = K_eff + threadIdx.x; i < P2s; i += blockDim.x) {
             s_out[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
         }
         __syncthreads();
