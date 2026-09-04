@@ -8,7 +8,8 @@
 - **bf16 relative error floor**: ~2e-3 for elementwise, ~1e-2 for reductions over
   long sequences is expected. Do not claim "exact" for bf16 math; claim bounded error.
 - Kernel output must be within `atol=5e-1 / rtol=5e-2` of a reference for
-  attention/scan outputs at production shapes (matches team's DFlash acceptance).
+  attention/scan outputs at production shapes (matches the production acceptance
+  thresholds used for this kernel family).
 - **Measured floor for gdn_chunk (bf16, S=2048–32768, decay g<0)**: out `rel ~9–11e-3`,
   state `rel ~7–10e-3`, stable in S (bounded by decayed accumulation). Tests accept
   `rel < 2e-2` — a real kernel bug produces `rel >= 1e-1`+, so the margin is safe.

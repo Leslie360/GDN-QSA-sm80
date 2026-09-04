@@ -2,6 +2,10 @@
 
 Implements the chunked and recurrent formulations of gated delta-rule linear
 attention in pure torch, used as the correctness anchor for the CUDA kernels.
+
+The public signature is API-compatible with the gated-delta-rule reference in
+fla (flash-linear-attention, MIT) for drop-in comparison; this is an
+independent torch implementation, not code copied from fla.
 """
 
 import torch

@@ -22,7 +22,7 @@ kernels and reproducible benchmarks against public baselines.
 Deliberately **out of scope** for this repo:
 
 - `fused_linear_ce` → experimental / training-side, not in the main API
-- `flashmla-sm80` → maintained separately (FlashMLA SM80 decode port, zero-CUTLASS)
+- `flashmla-sm80` → a separate SM80 MLA decode project, to be released independently
 
 ## Highlights
 

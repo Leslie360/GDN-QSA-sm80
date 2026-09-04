@@ -7,7 +7,7 @@
 
 1. **Same input** — both kernels receive identical tensors (same dtype, shape, values).
 2. **Same dtype** — bf16/fp16 must be identical across comparison; no hidden upcast for the baseline.
-3. **Same head layout** — expanded heads / head ratios must match on both sides (a fair baseline must not do extra `repeat_interleave` work — see team's `repeat-trap` note).
+3. **Same head layout** — expanded heads / head ratios must match on both sides. A fair baseline must not do extra `repeat_interleave` work: if one side pre-expands `Hq→Hv` heads as a separate tensor op while the other folds the expansion into the kernel, the eager expansion is extra kernel time that unfairly slows the baseline (the "repeat trap"). Give the baseline the already-expanded tensors, or state that the expansion is folded into both sides.
 4. **Same GPU** — comparisons happen on the *same physical device*, never cross-machine.
 5. **Clean GPU** — measure on an idle device. A shared/busy GPU inflates numbers ~2x. For A800, use a dedicated clean device (GPU0 of the bench machine).
 6. **Warmup + median** — warm up, then take the median (not min/max) over N runs.
