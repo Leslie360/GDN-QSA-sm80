@@ -51,7 +51,7 @@ long-sequence fast path).
 |---|---|
 | date | 2026-09-05 |
 | machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util during some runs, numbers below are the consistent (GPU0) medians |
-| tree state | commits `3dfef2f` (round-2 slab narrowing) + `df5311f` (encode vectorize) + `07a6838` (pool vectorize) |
+| tree state | commits `3dfef2f` (round-2 slab narrowing) + `df5311f` (encode vectorize) + `07a6838` (pool vectorize) + `253f0d8` (score invisible-tile exit) + `02daf87` (score float2+acc) + `7a418db` (topk pack-all) |
 | build command | `ENV=... CUDA_HOME=$ENV PATH=$ENV/bin:$PATH GDN_QSA_BUILD_OPS=qsa_indexer bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
 | correctness | **37/37 PASS** |
 
@@ -70,6 +70,14 @@ long-sequence fast path).
 - **pool-keys kernel: thread-per-block → one warp per (b,blk).**  Same
   coalescing + warp-reduce treatment (also cuts the B*NB-thread underfill that
   dominated short sequences).  pool 117 → 9 µs.
+- **score kernel: invisible-tile early exit + float2 key reads.**  Tiles the
+  causal mask fully hides write `-inf` and return before staging (skips the
+  global loads + barrier that ~half the blocks wasted); key rows padded to
+  `D+2` load 4 dims as 2 float2 reads (half the load-issue slots), and each
+  head's dot uses independent accumulators.  score 1.47 → ~1.0-1.2 ms.
+- **topk: pack-all candidates.**  Dense compaction's single `atomicAdd` counter
+  (contended by all 512 threads) is replaced by fixed-position packing with a
+  `NEG_INF_KEY` sentinel; `P`/`K_eff` come from a thread-0 pivot walk.
 - Host now requires D=128, R=64 (the production indexer shapes).
 
 ### qsa_indexer vs vectorized eager (fp32, Hq=4/D=128/R=64/r=4/KB=512)
@@ -77,14 +85,14 @@ long-sequence fast path).
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
 | 512 | 0.052 | 0.877 | 16.9x |
-| 2048 | 0.263 | 0.877 | 3.33x |
-| 8192 | 2.287 | 3.372 | 1.47x |
+| 2048 | 0.269 | 0.879 | 3.27x |
+| 8192 | 2.082 | 3.364 | 1.62x |
 
-At S=8192 the remaining time is score kernel 1.47ms + topk 0.79ms (both
-~roofline-bound for the scalar approach: the score kernel is smem/issue bound on
-a 48KB tile, and the TopK final sort is a 45-stage bitonic of the ~K winners).
-A tensor-core score with fp32-emulation or a fused score+radix kernel are the
-documented next steps.
+At S=8192 the remaining time is score kernel ~1.0-1.2ms + topk ~0.66-0.79ms
+(both near the scalar roofline: the score kernel is load-issue bound on a 48KB
+tile, and the TopK final sort is a 45-stage bitonic of the ~K winners).  A
+tensor-core score with fp32-emulation, a fused score+radix kernel, or a
+non-bitonic final sort are the documented next steps.
 
 ---
 

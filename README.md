@@ -192,13 +192,13 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
 | 512 | 0.052 | 0.877 | 16.9x |
-| 2048 | 0.263 | 0.877 | 3.33x |
-| 8192 | 2.287 | 3.372 | 1.47x |
+| 2048 | 0.269 | 0.879 | 3.27x |
+| 8192 | 2.082 | 3.364 | 1.62x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
 
 The two-stage path (pool → encode → tiled score → per-query TopK) beats the
-vectorized eager baseline at every length, including `S=8192` (`1.47x`).  The
+vectorized eager baseline at every length, including `S=8192` (`1.62x`).  The
 wins come from SM80-scalar work-splitting and sorting:
 
 - **Coalesced preprocess kernels.** The pool-keys and encode kernels each run
@@ -208,13 +208,18 @@ wins come from SM80-scalar work-splitting and sorting:
   thread-per-row versions read rows strided `D` floats apart (~2–3% coalescing)
   and under-filled the GPU at short lengths — pool 117→9 µs, encode 349→27 µs
   at `S=8192`, and `S=512` dropped ~6× overall.
+- **Score kernel: invisible-tile early exit + float2 key reads.** Tiles the
+  causal mask fully hides now write `-inf` and return before staging (skips the
+  global loads + barrier); key rows padded to `D+2` load the 4 dims as 2 float2
+  reads instead of 4 scalar `LDS.32` (half the load-issue slots), and each
+  head's dot uses independent accumulators to shorten the FMA chains.
 - **TopK round-2 slab narrowing.** The `==pivot` slab of the radix select is
   narrowed one byte at a time (CUB `block_topk_air` style) instead of a full
   `O(eq_n log² eq_n)` bitonic sort; once it fits one warp it is sorted in
   registers with warp-shuffle bitonic.  The exact `K` winners are then ordered
-  by a bitonic sort of only `~K` elements.
-- The score kernel stages each block-key tile in shared memory and reuses it
-  across `SCORE_CQ=16` query rows (scalar float4 dots, fp32-exact).
+  by a bitonic sort of only `~K` elements.  Candidates are packed to fixed
+  positions (no single-counter `atomicAdd` contention), and `P`/`K_eff` come
+  from a thread-0 pivot walk.
 
 A fused topK-only variant (`qsa_indexer_topk_only`) skips materializing the
 dense `[S,NB]` score matrix entirely (lower peak memory, no 64MB write/read at
