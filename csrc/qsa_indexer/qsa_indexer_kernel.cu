@@ -115,7 +115,16 @@ __global__ void indexer_pool_keys_kernel(
 // ---------------------------------------------------------------------------
 // Kernel B: encode each query: RMSNorm over D + partial RoPE at token position.
 //   qenc[B, S, Hq, D]
-// One thread per (batch, query, head).
+//
+// One WARP per (batch, query, head); lane dg owns the float4 at dims
+// [4*dg, 4*dg+4).  The old thread-per-row version read each thread's 128-float
+// row with 32 threads strided D floats apart, so every global load touched 32
+// separate 128B cache lines (3% coalescing) and the kernel ran ~17x off its
+// memory roofline at S=8192.  Reading one dims-contiguous float4 per lane makes
+// the warp's 32 loads land in consecutive lines.  The RMSNorm sum is a 32-lane
+// warp reduction (no barriers); the partial RoPE pairs dims (d, d+R/2) whose
+// float4s sit 8 lanes apart, exchanged with one __shfl_xor.
+// Requires D == 128 and D % 4 == 0, R % 8 == 0 (the production indexer shapes).
 // ---------------------------------------------------------------------------
 __global__ void indexer_encode_q_kernel(
     const float* __restrict__ q,          // [B,S,Hq,D]
@@ -124,36 +133,67 @@ __global__ void indexer_encode_q_kernel(
     float* __restrict__ qenc,             // [B,S,Hq,D]
     int B, int S, int Hq, int D, int R)
 {
+    const int D4 = D / 4;                 // 32 float4 per row for D=128
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * S * Hq;
+    int total = B * S * Hq * D4;
     if (idx >= total) return;
 
-    int h = idx % Hq;
-    int t = (idx / Hq) % S;
-    int b = idx / (Hq * S);
+    int dg = idx % D4;                    // dim group (lane)
+    int ih = idx / D4;                    // (b*S + t) * Hq + h
+    int h = ih % Hq;
+    int t = (ih / Hq) % S;
+    int b = ih / (Hq * S);
 
-    const float* qh = q + ((size_t)b * S + t) * Hq * D + (size_t)h * D;
+    const float4* q4 = reinterpret_cast<const float4*>(q)
+                     + ((size_t)b * S + t) * Hq * D4 + (size_t)h * D4;
+    float4 v = q4[dg];
 
-    // RMSNorm
-    float mean_sq = 0.0f;
-    for (int d = 0; d < D; ++d) mean_sq += qh[d] * qh[d];
-    mean_sq /= (float)D;
-    float rms_inv = rsqrtf_(mean_sq + 1e-6f);
+    // RMSNorm: warp-reduce the sum of squares over all D dims.
+    // D == 128 (host-enforced), so D4 == 32 and the shuffle distances are fixed.
+    float ssum = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 16);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 8);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 4);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 2);
+    ssum += __shfl_xor_sync(0xFFFFFFFFu, ssum, 1);
+    float rms_inv = rsqrtf_(ssum / (float)D + 1e-6f);
+    float4 out = make_float4(v.x * rms_inv, v.y * rms_inv,
+                             v.z * rms_inv, v.w * rms_inv);
 
-    float* qe = qenc + ((size_t)b * S + t) * Hq * D + (size_t)h * D;
-    for (int d = 0; d < D; ++d) qe[d] = qh[d] * rms_inv;
-
-    // partial RoPE at token position t
-    const float* ctp = cos_q + (size_t)b * S * R + (size_t)t * R;
-    const float* stp = sin_q + (size_t)b * S * R + (size_t)t * R;
-    for (int d = 0; d < R / 2; ++d) {
-        float x0 = qe[d];
-        float x1 = qe[d + R / 2];
-        float co = ctp[d];
-        float si = stp[d];
-        qe[d]         = x0 * co - x1 * si;
-        qe[d + R / 2] = x0 * si + x1 * co;
+    // partial RoPE over the first R = 64 dims: pairs (d, d + 32) for d in [0,32).
+    // Dims 4*dg..4*dg+3 are in the rope region iff dg < 16; the partner float4
+    // (dims +32) is 8 lanes away.  Lanes < 8 write the first half, the rest the
+    // second half, using the cos/sin pair index (dg & 7).
+    if (4 * dg < R) {
+        float4 partner;                   // float4 has no shuffle overload
+        partner.x = __shfl_xor_sync(0xFFFFFFFFu, out.x, 8);
+        partner.y = __shfl_xor_sync(0xFFFFFFFFu, out.y, 8);
+        partner.z = __shfl_xor_sync(0xFFFFFFFFu, out.z, 8);
+        partner.w = __shfl_xor_sync(0xFFFFFFFFu, out.w, 8);
+        int m = dg & 7;                   // cos/sin index for this dim group
+        const float4* c4 = reinterpret_cast<const float4*>(cos_q)
+                         + ((size_t)b * S + t) * (R / 4) + m;
+        const float4* s4 = reinterpret_cast<const float4*>(sin_q)
+                         + ((size_t)b * S + t) * (R / 4) + m;
+        float4 co = c4[0], si = s4[0];
+        if (dg < 8) {
+            // first half: new[d]       = x[d]*c - x[d+R/2]*s
+            out.x = out.x * co.x - partner.x * si.x;
+            out.y = out.y * co.y - partner.y * si.y;
+            out.z = out.z * co.z - partner.z * si.z;
+            out.w = out.w * co.w - partner.w * si.w;
+        } else {
+            // second half: new[d+R/2]  = x[d]*s + x[d+R/2]*c
+            out.x = partner.x * si.x + out.x * co.x;
+            out.y = partner.y * si.y + out.y * co.y;
+            out.z = partner.z * si.z + out.z * co.z;
+            out.w = partner.w * si.w + out.w * co.w;
+        }
     }
+
+    float4* o4 = reinterpret_cast<float4*>(qenc)
+               + ((size_t)b * S + t) * Hq * D4 + (size_t)h * D4;
+    o4[dg] = out;
 }
 
 // ---------------------------------------------------------------------------
@@ -744,10 +784,11 @@ std::vector<torch::Tensor> qsa_indexer_forward(
     int D  = q.size(3);
     int R  = cos_q.size(2);
     TORCH_CHECK(S % r == 0, "S must be divisible by compress ratio");
+    TORCH_CHECK(D == 128, "indexer encode/score kernels are specialized for D=128");
     int NB = S / (int)r;
     TORCH_CHECK(raw_keys.size(0) == B && raw_keys.size(1) == S && raw_keys.size(2) == D);
     TORCH_CHECK(cos_q.size(0) == B && cos_q.size(1) == S);
-    TORCH_CHECK(R % 2 == 0 && R <= D && R % 4 == 0);
+    TORCH_CHECK(R == 64, "indexer encode kernel is specialized for R=64");
 
     auto opts = q.options();
     auto block_scores = torch::empty({B, S, NB}, opts);
@@ -774,9 +815,9 @@ std::vector<torch::Tensor> qsa_indexer_forward(
     CHECK_LAUNCH("pool_keys");
     }
 
-    // Kernel B: encode queries
+    // Kernel B: encode queries (one warp per (b,s,h), dims-contiguous loads)
     {
-        int total = B * S * Hq;
+        int total = B * S * Hq * (D / 4);
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         indexer_encode_q_kernel<<<blocks, threads, 0, stream>>>(
@@ -871,10 +912,11 @@ std::vector<torch::Tensor> qsa_indexer_topk_only_forward(
     int D  = q.size(3);
     int R  = cos_q.size(2);
     TORCH_CHECK(S % r == 0, "S must be divisible by compress ratio");
+    TORCH_CHECK(D == 128, "indexer encode/score kernels are specialized for D=128");
     int NB = S / (int)r;
     TORCH_CHECK(raw_keys.size(0) == B && raw_keys.size(1) == S && raw_keys.size(2) == D);
     TORCH_CHECK(cos_q.size(0) == B && cos_q.size(1) == S);
-    TORCH_CHECK(R % 2 == 0 && R <= D && R % 4 == 0);
+    TORCH_CHECK(R == 64, "indexer encode kernel is specialized for R=64");
 
     auto opts = q.options();
     auto block_indices = torch::empty({B, S, (int)block_topk}, at::TensorOptions().dtype(at::kInt).device(q.device()));
@@ -898,9 +940,9 @@ std::vector<torch::Tensor> qsa_indexer_topk_only_forward(
     CHECK_LAUNCH("pool_keys");
     }
 
-    // Kernel B: encode queries
+    // Kernel B: encode queries (one warp per (b,s,h), dims-contiguous loads)
     {
-        int total = B * S * Hq;
+        int total = B * S * Hq * (D / 4);
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
         indexer_encode_q_kernel<<<blocks, threads, 0, stream>>>(
