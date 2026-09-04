@@ -67,15 +67,20 @@ on 5000 random inputs including heavy-tie / constant cases.
 
 | S | qsa_indexer (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.318 | 0.852 | 2.68x |
-| 2048 | 0.528 | 0.860 | 1.63x |
-| 8192 | 3.088 | 3.368 | **1.09x** |
+| 512 | 0.052 | 0.877 | 16.9x |
+| 2048 | 0.263 | 0.877 | 3.33x |
+| 8192 | 2.287 | 3.372 | **1.47x** |
 
 The two-stage path beats the vectorized eager baseline at every length,
-including `S=8192`.  The fused `qsa_indexer_topk_only` skips the dense score
-matrix (lower memory) but is per-query-CTA based and loses the cross-query key
-reuse of the tiled score kernel, so it is *not* the fast path at `S=8192` — use
-`qsa_indexer` there.  Bench: `python benchmarks/bench_qsa_indexer.py`.
+including `S=8192`.  The win comes from (1) coalesced one-warp-per-row
+pool/encode kernels (dims-contiguous `float4` loads + warp-reduce RMSNorm +
+`__shfl_xor` RoPE), (2) a radix TopK whose `==pivot` slab is narrowed byte-wise
+and warp-shuffle-sorted instead of a full bitonic sort, and (3) cross-query
+block-key reuse in the tiled score kernel.  The fused `qsa_indexer_topk_only`
+skips the dense score matrix (lower memory) but is per-query-CTA based and loses
+the cross-query key reuse of the tiled score kernel, so it is *not* the fast
+path at `S=8192` — use `qsa_indexer` there.  Bench:
+`python benchmarks/bench_qsa_indexer.py`.
 
 ## Reproduce
 

@@ -191,19 +191,30 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.318 | 0.852 | 2.68x |
-| 2048 | 0.528 | 0.860 | 1.63x |
-| 8192 | 3.088 | 3.368 | 1.09x |
+| 512 | 0.052 | 0.877 | 16.9x |
+| 2048 | 0.263 | 0.877 | 3.33x |
+| 8192 | 2.287 | 3.372 | 1.47x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
 
 The two-stage path (pool → encode → tiled score → per-query TopK) beats the
-vectorized eager baseline at every length, including `S=8192` (`1.09x`). The
-long-sequence win comes from two SM80-scalar optimizations: (1) the score kernel
-reuses each staged block-key tile across `SCORE_CQ=16` queries, halving
-per-score shared-memory traffic vs the earlier `SCORE_CQ=8`; (2) TopK is a
-one-round radix select + bitonic sort of only the ~K winners, replacing a full
-`O(P log²P)` bitonic sort of all visible blocks.
+vectorized eager baseline at every length, including `S=8192` (`1.47x`).  The
+wins come from SM80-scalar work-splitting and sorting:
+
+- **Coalesced preprocess kernels.** The pool-keys and encode kernels each run
+  one warp per (batch·block / batch·query·head) row, so every lane owns one
+  dims-contiguous `float4`; the RMSNorm sum is a 32-lane warp reduction and the
+  partial RoPE pair is exchanged with a single `__shfl_xor`.  The old
+  thread-per-row versions read rows strided `D` floats apart (~2–3% coalescing)
+  and under-filled the GPU at short lengths — pool 117→9 µs, encode 349→27 µs
+  at `S=8192`, and `S=512` dropped ~6× overall.
+- **TopK round-2 slab narrowing.** The `==pivot` slab of the radix select is
+  narrowed one byte at a time (CUB `block_topk_air` style) instead of a full
+  `O(eq_n log² eq_n)` bitonic sort; once it fits one warp it is sorted in
+  registers with warp-shuffle bitonic.  The exact `K` winners are then ordered
+  by a bitonic sort of only `~K` elements.
+- The score kernel stages each block-key tile in shared memory and reuses it
+  across `SCORE_CQ=16` query rows (scalar float4 dots, fp32-exact).
 
 A fused topK-only variant (`qsa_indexer_topk_only`) skips materializing the
 dense `[S,NB]` score matrix entirely (lower peak memory, no 64MB write/read at
@@ -237,9 +248,10 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 ## Roadmap
 
 - `qsa_indexer` now beats the vectorized eager baseline at all lengths, including
-  `S=8192` (1.09x), via cross-query block-key reuse in the score kernel and a
-  radix-select TopK. Further gains would come from a fused score+radix kernel
-  (single pass, no dense `[S,NB]` materialization).
+  `S=8192` (1.47x), via coalesced preprocess kernels, a narrowing radix-select
+  TopK, and cross-query block-key reuse in the score kernel. Further gains would
+  come from a fused score+radix kernel (single pass, no dense `[S,NB]`
+  materialization) and tensor-core score with fp32-emulation precision.
 - `qsa_core` TC pass-2 is a documented ~1.5x win over scalar; further gains are
   expected from a fused pass-1+pass-2 kernel.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo

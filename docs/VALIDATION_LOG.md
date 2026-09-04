@@ -45,6 +45,49 @@ long-sequence fast path).
 
 ---
 
+## Run 3 (2026-09-05) — qsa_indexer coalescing + TopK narrowing
+
+| Field | Value |
+|---|---|
+| date | 2026-09-05 |
+| machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util during some runs, numbers below are the consistent (GPU0) medians |
+| tree state | commits `3dfef2f` (round-2 slab narrowing) + `df5311f` (encode vectorize) + `07a6838` (pool vectorize) |
+| build command | `ENV=... CUDA_HOME=$ENV PATH=$ENV/bin:$PATH GDN_QSA_BUILD_OPS=qsa_indexer bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
+| correctness | **37/37 PASS** |
+
+### What changed
+
+- **TopK round-2: bitonic → byte-wise slab narrowing + warp-shuffle tail.**
+  The `==b1` radix slab can be hundreds of elements (ReLU scores cluster in a
+  few exponent buckets), but only its top-`need` is kept.  Narrow it one 8-bit
+  byte at a time (CUB `block_topk_air` style): histogram the current byte of the
+  candidate slab, keep `==pivot` as the next smaller slab, collect `>pivot` as
+  final winners; once the slab fits one warp (≤32) it is warp-shuffle-sorted in
+  registers (no barriers, no smem round trips).  topk kernel 1.26ms → 0.79ms.
+- **encode kernel: thread-per-row → one warp per (b,q,h) row.**  Lane `dg`
+  loads the dims-contiguous `float4` (fully coalesced vs ~3% before); RMSNorm
+  is a 32-lane warp reduction; RoPE pair is a `__shfl_xor`.  encode 349 → 27 µs.
+- **pool-keys kernel: thread-per-block → one warp per (b,blk).**  Same
+  coalescing + warp-reduce treatment (also cuts the B*NB-thread underfill that
+  dominated short sequences).  pool 117 → 9 µs.
+- Host now requires D=128, R=64 (the production indexer shapes).
+
+### qsa_indexer vs vectorized eager (fp32, Hq=4/D=128/R=64/r=4/KB=512)
+
+| S | ours (ms) | eager (ms) | speedup |
+|---|---|---|---|
+| 512 | 0.052 | 0.877 | 16.9x |
+| 2048 | 0.263 | 0.877 | 3.33x |
+| 8192 | 2.287 | 3.372 | 1.47x |
+
+At S=8192 the remaining time is score kernel 1.47ms + topk 0.79ms (both
+~roofline-bound for the scalar approach: the score kernel is smem/issue bound on
+a 48KB tile, and the TopK final sort is a 45-stage bitonic of the ~K winners).
+A tensor-core score with fp32-emulation or a fused score+radix kernel are the
+documented next steps.
+
+---
+
 ## Run 1 (2026-09-04)
 
 | Field | Value |
