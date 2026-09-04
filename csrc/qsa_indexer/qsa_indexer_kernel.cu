@@ -36,6 +36,7 @@
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_pipeline.h>
 #include <cuda_fp16.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <math_constants.h>
@@ -280,15 +281,19 @@ __global__ void indexer_score_kernel(
         return;
     }
 
-    // Stage the query tile [q0, q0+CQ) x [Hq, D] (float4).
+    // Stage the query tile [q0, q0+CQ) x [Hq, D] (float4) with cp.async so the
+    // copies proceed while the block-key tile (padded transpose, not cp.async-
+    // able) is staged; __pipeline_wait_prior(0) lands right before the compute
+    // barrier so the two stages overlap.
     {
         const float4* src = qenc + ((size_t)b * S + q0) * HqD4;
         for (int i = threadIdx.x; i < SCORE_CQ * HqD4; i += blockDim.x) {
             int lq = i / HqD4;
-            if (q0 + lq < S) sh_q[i] = src[i];
+            if (q0 + lq < S) __pipeline_memcpy_async(&sh_q[i], src + i, sizeof(float4));
         }
+        __pipeline_commit();
     }
-    // Stage the block-key tile [b0, b0+CB) x [D] as padded floats (row stride D+1).
+    // Stage the block-key tile [b0, b0+CB) x [D] as padded floats (row stride D+2).
     {
         const float4* src = kbar + ((size_t)b * NB + b0) * D4;
         for (int i = threadIdx.x; i < SCORE_CB * D4; i += blockDim.x) {
@@ -300,6 +305,7 @@ __global__ void indexer_score_kernel(
             }
         }
     }
+    __pipeline_wait_prior(0);
     __syncthreads();
 
     int tid = threadIdx.x;          // 0 .. SCORE_CQ*SCORE_CB-1
