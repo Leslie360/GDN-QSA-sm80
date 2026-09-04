@@ -9,7 +9,7 @@ benchmark table row traces to a run below.
 |---|---|
 | date | 2026-09-04 |
 | machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80), idle GPU used for measurement |
-| tree state | M1+M2+M3 commits (`7653334`, `d51295b`) + debug-naming cleanup (uncommitted) |
+| tree state | commits `7653334` (M1), `d51295b` (M2+M3), `f12e89a` (review-fix) |
 | build command | `TORCH_CUDA_ARCH_LIST=8.0 <python> setup.py build_ext --inplace` (torch 2.6.0+cu124, nvcc 12.4, python 3.10, CUDA_HOME set to the toolchain) |
 | test command | `CUDA_VISIBLE_DEVICES=0 <python> -m pytest tests/ -v` |
 | benchmark command | `CUDA_VISIBLE_DEVICES=0 <python> benchmarks/bench_<op>.py` (+ fla on PYTHONPATH for gdn_chunk baseline) |

@@ -137,8 +137,8 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
     const BF16* __restrict__ beta_ptr, int beta_row_stride, // [H, T] head-major
     BF16* __restrict__ A_g,
     BF16* __restrict__ B_g,
-    float* __restrict__ dbg_out,   // optional [8] debug buffer (may be null)
-    float* __restrict__ dbg_full,  // optional [4*C*D + 2*D*D] f32 dump (may be null)
+    float* __restrict__ diag_out,   // optional [8] diagnostic buffer (may be null)
+    float* __restrict__ diag_full,  // optional [4*C*D + 2*D*D] f32 diagnostic dump (may be null)
     int ws_tile_elems,   // CHUNK*D
     int ws_tile_lm,      // CHUNK*CHUNK
     int ws_gt_elems,     // D
@@ -351,7 +351,7 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
             }
         }
         __syncthreads();
-        if (lc == 0 && seq == 0 && head == 0 && group == 0 && tid == 0 && dbg_out != nullptr) {
+        if (lc == 0 && seq == 0 && head == 0 && group == 0 && tid == 0 && diag_out != nullptr) {
             float mp = 0, mr = 0, mv = 0, mi = 0, mk = 0, mkd = 0;
             for (int e = 0; e < CHUNK * D; ++e) {
                 mp = fmaxf(mp, fabsf(bf16_to_f32(P_t(e / D, e % D))));
@@ -362,15 +362,15 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
             for (int e = 0; e < CHUNK * CHUNK; ++e) {
                 mi = fmaxf(mi, fabsf(bf16_to_f32(INV_t(e / CHUNK, e % CHUNK))));
             }
-            dbg_out[0] = mp; dbg_out[1] = mr; dbg_out[2] = mv;
-            dbg_out[5] = mi; dbg_out[6] = mk; dbg_out[7] = 0;
+            diag_out[0] = mp; diag_out[1] = mr; diag_out[2] = mv;
+            diag_out[5] = mi; diag_out[6] = mk; diag_out[7] = 0;
         }
         // Full dump: P [C,D], R [C,D] (logical row-major) — every chunk of group 0
-        if (seq == 0 && head == 0 && group == 0 && dbg_full != nullptr) {
+        if (seq == 0 && head == 0 && group == 0 && diag_full != nullptr) {
             const int64_t slot = int64_t(lc) * (4 * CHUNK * D + 2 * D * D);
             for (int i = tid; i < CHUNK * D; i += NumThreads) {
-                dbg_full[slot + 0 * CHUNK * D + i] = bf16_to_f32(P_t(i / D, i % D));
-                dbg_full[slot + 1 * CHUNK * D + i] = bf16_to_f32(R_t(i / D, i % D));
+                diag_full[slot + 0 * CHUNK * D + i] = bf16_to_f32(P_t(i / D, i % D));
+                diag_full[slot + 1 * CHUNK * D + i] = bf16_to_f32(R_t(i / D, i % D));
             }
             __syncthreads();
         }
@@ -417,11 +417,11 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
         __syncthreads();
 
         // Full dump: tmpA [C,D], tmpB [C,D]
-        if (seq == 0 && head == 0 && group == 0 && dbg_full != nullptr) {
+        if (seq == 0 && head == 0 && group == 0 && diag_full != nullptr) {
             const int64_t slot = int64_t(lc) * (4 * CHUNK * D + 2 * D * D);
             for (int i = tid; i < CHUNK * D; i += NumThreads) {
-                dbg_full[slot + 2 * CHUNK * D + i] = bf16_to_f32(tA_t(i / D, i % D));
-                dbg_full[slot + 3 * CHUNK * D + i] = bf16_to_f32(tB_t(i / D, i % D));
+                diag_full[slot + 2 * CHUNK * D + i] = bf16_to_f32(tA_t(i / D, i % D));
+                diag_full[slot + 3 * CHUNK * D + i] = bf16_to_f32(tB_t(i / D, i % D));
             }
             __syncthreads();
         }
@@ -522,20 +522,20 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
         }
         // global check after chunk 0 Phase D: max|A| and max|B| over smem state
         __syncthreads();
-        if (lc == 0 && seq == 0 && head == 0 && group == 0 && tid == 0 && dbg_out != nullptr) {
+        if (lc == 0 && seq == 0 && head == 0 && group == 0 && tid == 0 && diag_out != nullptr) {
             float mA = 0, mB = 0;
             for (int e = 0; e < D * D; ++e) {
                 mA = fmaxf(mA, fabsf(bf16_to_f32(A_T(e / D, e % D))));
                 mB = fmaxf(mB, fabsf(bf16_to_f32(B_T(e / D, e % D))));
             }
-            dbg_out[3] = mA; dbg_out[4] = mB;
+            diag_out[3] = mA; diag_out[4] = mB;
         }
         // Full dump: A [D,D], B [D,D] (logical row-major via A_T/B_T)
-        if (seq == 0 && head == 0 && group == 0 && dbg_full != nullptr) {
+        if (seq == 0 && head == 0 && group == 0 && diag_full != nullptr) {
             const int64_t slot = int64_t(lc) * (4 * CHUNK * D + 2 * D * D);
             for (int i = tid; i < D * D; i += NumThreads) {
-                dbg_full[slot + 4 * CHUNK * D + i] = bf16_to_f32(A_T(i / D, i % D));
-                dbg_full[slot + 4 * CHUNK * D + D * D + i] = bf16_to_f32(B_T(i / D, i % D));
+                diag_full[slot + 4 * CHUNK * D + i] = bf16_to_f32(A_T(i / D, i % D));
+                diag_full[slot + 4 * CHUNK * D + D * D + i] = bf16_to_f32(B_T(i / D, i % D));
             }
         }
     }
@@ -568,8 +568,8 @@ extern "C" void gdn_scan_stage1(
     const cutlass::bfloat16_t* beta_ptr, int beta_row_stride,
     cutlass::bfloat16_t* A_g,
     cutlass::bfloat16_t* B_g,
-    float* dbg_out,
-    float* dbg_full,
+    float* diag_out,
+    float* diag_full,
     int ws_tile_elems, int ws_tile_lm, int ws_gt_elems,
     int T_seq, int H, int B, int chunks_per_seq,
     int GROUP_CHUNKS, cudaStream_t stream) {
@@ -589,7 +589,7 @@ extern "C" void gdn_scan_stage1(
         <<<grid, block, smem, stream>>>(
         ws_kd, ws_kr, ws_gt, ws_inv,
         v_ptr, v_row_stride, beta_ptr, beta_row_stride,
-        A_g, B_g, dbg_out, dbg_full,
+        A_g, B_g, diag_out, diag_full,
         ws_tile_elems, ws_tile_lm, ws_gt_elems,
         T_seq, H, chunks_per_seq, GROUP_CHUNKS);
 }

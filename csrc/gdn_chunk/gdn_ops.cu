@@ -102,8 +102,8 @@ extern "C" void gdn_scan_stage1(
     const cutlass::bfloat16_t* beta_ptr, int beta_row_stride,
     cutlass::bfloat16_t* A_g,
     cutlass::bfloat16_t* B_g,
-    float* dbg_out,
-    float* dbg_full,
+    float* diag_out,
+    float* diag_full,
     int ws_tile_elems, int ws_tile_lm, int ws_gt_elems,
     int T_seq, int H, int B, int chunks_per_seq,
     int GROUP_CHUNKS, cudaStream_t stream);

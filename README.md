@@ -5,6 +5,8 @@ Standalone **SM80 (A800) CUDA operators** for the **Gated DeltaNet + Sparse Atte
 Optimized for modern open-weight GDN + QSA models on SM80/A800.
 
 > Status: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
+>
+> Validation: clean-A800 build/test/bench record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md).
 
 ## Scope
 
