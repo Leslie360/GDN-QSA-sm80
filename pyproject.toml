@@ -16,8 +16,9 @@ dependencies = ["torch"]
 test = ["pytest", "numpy"]
 benchmark = ["matplotlib", "pandas"]
 
-[tool.setuptools]
-packages = ["gdn_qsa_sm80"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gdn_qsa_sm80*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
