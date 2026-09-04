@@ -19,7 +19,7 @@ kernels and reproducible benchmarks against public baselines.
 
 > **Status**: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
 >
-> **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (33/33 tests PASS).
+> **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
 
 ## News
 
@@ -126,14 +126,19 @@ out, final_state = gdn_chunk(q, k, v, g, beta, output_final_state=True)
 `gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by `S`.
 See [`docs/GDN_CHUNK.md`](docs/GDN_CHUNK.md).
 
-### QSA indexer — `qsa_indexer`
+### QSA indexer — `qsa_indexer` / `qsa_indexer_topk_only`
 
 ```python
-from gdn_qsa_sm80 import qsa_indexer
+from gdn_qsa_sm80 import qsa_indexer, qsa_indexer_topk_only
 
+# full API: also returns the dense [B,S,NB] block_scores matrix (debug/compat)
 block_scores, block_indices, selected_scores = qsa_indexer(
     q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512)
 # q/raw_keys fp32, cos/sin [B,S,R] -> block_indices [B,S,KB] int32 (-1 pad)
+
+# memory-light API: fused score+TopK, never materializes block_scores
+block_indices, selected_scores = qsa_indexer_topk_only(
+    q, raw_keys, cos_q, sin_q, cos_k, sin_k, r=4, block_topk=512)
 ```
 
 See [`docs/QSA_INDEXER.md`](docs/QSA_INDEXER.md).
@@ -186,16 +191,25 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.247 | 0.882 | 3.57x |
-| 2048 | 0.582 | 0.890 | 1.53x |
-| 8192 | 5.453 | 3.383 | 0.62x |
+| 512 | 0.318 | 0.852 | 2.68x |
+| 2048 | 0.528 | 0.860 | 1.63x |
+| 8192 | 3.088 | 3.368 | 1.09x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
 
-> `qsa_indexer` is optimized for short/medium sequences; at `S=8192` the current
-> CUDA path is bandwidth-bound (dense `[S,NB]` score matrix) and slower than the
-> vectorized eager baseline. Tracked as future work — the kernel does not
-> advertise a long-sequence win.
+The two-stage path (pool → encode → tiled score → per-query TopK) beats the
+vectorized eager baseline at every length, including `S=8192` (`1.09x`). The
+long-sequence win comes from two SM80-scalar optimizations: (1) the score kernel
+reuses each staged block-key tile across `SCORE_CQ=16` queries, halving
+per-score shared-memory traffic vs the earlier `SCORE_CQ=8`; (2) TopK is a
+one-round radix select + bitonic sort of only the ~K winners, replacing a full
+`O(P log²P)` bitonic sort of all visible blocks.
+
+A fused topK-only variant (`qsa_indexer_topk_only`) skips materializing the
+dense `[S,NB]` score matrix entirely (lower peak memory, no 64MB write/read at
+`S=8192`) but is per-query CTA-based, so it loses the cross-query block-key
+reuse of the tiled score kernel and is not the fast path at long sequences —
+the two-stage `qsa_indexer` is recommended for `S=8192`.
 
 ### output_gate (bf16, G=4096 → O=2560)
 
@@ -222,8 +236,10 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 
 ## Roadmap
 
-- `qsa_indexer` long-sequence (`S=8192+`) is bandwidth-bound and slower than a
-  vectorized eager baseline; a split-K score path is planned.
+- `qsa_indexer` now beats the vectorized eager baseline at all lengths, including
+  `S=8192` (1.09x), via cross-query block-key reuse in the score kernel and a
+  radix-select TopK. Further gains would come from a fused score+radix kernel
+  (single pass, no dense `[S,NB]` materialization).
 - `qsa_core` TC pass-2 is a documented ~1.5x win over scalar; further gains are
   expected from a fused pass-1+pass-2 kernel.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo

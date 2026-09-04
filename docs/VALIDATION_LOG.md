@@ -3,6 +3,48 @@
 Clean A800 (SM80) build / test / benchmark record for gdn-qsa-sm80. Every README
 benchmark table row traces to a run below.
 
+## Run 2 (2026-09-04) — qsa_indexer long-sequence optimization
+
+| Field | Value |
+|---|---|
+| date | 2026-09-04 |
+| machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80), idle GPU |
+| tree state | commits `cdd4946` (topk P2-window) + `6d57fce` (radix topk) + `b556c70` (SCORE_CQ=16) |
+| build command | `ENV=... GDN_QSA_BUILD_OPS=qsa_indexer bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
+| test command | `CUDA_VISIBLE_DEVICES=0 <python> -m pytest tests/ -q` |
+| correctness | **37/37 PASS** (4 indexer + 4 new fused/topk-only tests added) |
+
+### What changed
+
+- **Kernel D TopK: bitonic → one-round radix select.** Histogram the top 8 bits
+  of a packed `(sortable score, reversed index)` uint64 key, find the pivot
+  bucket, collect the ~`block_topk` winners, and bitonic-sort only those.
+  CPU-validated in `tests/radix_topk_proto.py` (5000/5000 vs a full sort on
+  normal/uniform/heavy-tie/constant data).  topk kernel 1.85ms → 1.23ms at S=8192.
+- **Kernel C score: `SCORE_CQ` 8 → 16.** Each staged block-key tile is shared by
+  16 query rows (512 threads, one thread per cell), halving per-score
+  shared-memory key traffic.  score kernel 2.34ms → 1.71ms at S=8192.
+  `SCORE_REG` register-blocking and `SCORE_CQ=32` were measured and rejected
+  (occupancy loss).  score kernel got a 48KB+ smem opt-in.
+- **New API `qsa_indexer_topk_only`**: fused per-query score+TopK, never
+  materializes the dense `[B,S,NB]` block_scores (lower peak memory).  Correct
+  (matches full API IOU>0.999, score err<1e-3) but not the S=8192 fast path.
+
+### qsa_indexer vs vectorized eager (fp32, Hq=4/D=128/R=64/r=4/KB=512; median of 5)
+
+| S | ours (ms) | eager (ms) | speedup |
+|---|---|---|---|
+| 512 | 0.318 | 0.852 | 2.68x |
+| 2048 | 0.528 | 0.860 | 1.63x |
+| 8192 | 3.088 | 3.368 | **1.09x** |
+
+`qsa_indexer` now beats eager at all lengths, including S=8192 (previously
+0.62x / bandwidth-bound).  Fused `qsa_indexer_topk_only`: 512=0.313ms,
+2048=0.730ms, 8192=6.22ms (per-query CTA loses cross-query key reuse; not the
+long-sequence fast path).
+
+---
+
 ## Run 1 (2026-09-04)
 
 | Field | Value |
