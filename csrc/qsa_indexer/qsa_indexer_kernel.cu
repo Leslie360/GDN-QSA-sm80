@@ -259,7 +259,7 @@ __global__ void indexer_score_kernel(
 
     extern __shared__ char smem_raw[];
     float4* sh_q = reinterpret_cast<float4*>(smem_raw);            // SCORE_CQ * HqD4 float4
-    float*  sh_kf = reinterpret_cast<float*>(smem_raw + (size_t)SCORE_CQ * HqD4 * sizeof(float4)); // SCORE_CB * (D+1) floats
+    float*  sh_kf = reinterpret_cast<float*>(smem_raw + (size_t)SCORE_CQ * HqD4 * sizeof(float4)); // SCORE_CB * (D+2) floats
 
     int qtile = blockIdx.x;
     int btile = blockIdx.y;
@@ -295,7 +295,7 @@ __global__ void indexer_score_kernel(
             int lb = i / D4;
             if (b0 + lb < NB) {
                 float4 v = src[i];
-                float* row = sh_kf + (size_t)lb * (D + 1) + (size_t)(i % D4) * 4;
+                float* row = sh_kf + (size_t)lb * (D + 2) + (size_t)(i % D4) * 4;
                 row[0] = v.x; row[1] = v.y; row[2] = v.z; row[3] = v.w;
             }
         }
@@ -314,30 +314,46 @@ __global__ void indexer_score_kernel(
 
     float score = -CUDART_INF_F;
     if (visible && inb) {
-        const float* kk = sh_kf + (size_t)c * (D + 1);
+        const float2* kk = reinterpret_cast<const float2*>(sh_kf + (size_t)c * (D + 2));
         if (Hq == 4) {
             // Loop exchange (Hq=4 fast path): each block-key element is read from
             // shared memory ONCE per dim and reused across the 4 query heads —
             // the h-outer form re-reads kk[] Hq times (4x redundant smem reads).
             // Per-head accumulators are needed because ReLU is applied per head.
-            float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+            // Four accumulators per head fully break the serial FMA dependency
+            // chain (each += feeds exactly one dim-product per d); the 4-acc
+            // version was latency-limited at ~500 cyc/warp-d.
+            float d0a = 0, d0b = 0, d0c = 0, d0d = 0;
+            float d1a = 0, d1b = 0, d1c = 0, d1d = 0;
+            float d2a = 0, d2b = 0, d2c = 0, d2d = 0;
+            float d3a = 0, d3b = 0, d3c = 0, d3d = 0;
             const float4* q0 = sh_q + (size_t)(rq * 4 + 0) * D4;
             const float4* q1 = sh_q + (size_t)(rq * 4 + 1) * D4;
             const float4* q2 = sh_q + (size_t)(rq * 4 + 2) * D4;
             const float4* q3 = sh_q + (size_t)(rq * 4 + 3) * D4;
             #pragma unroll 8
             for (int d = 0; d < D4; ++d) {
-                float k0 = kk[d * 4 + 0];
-                float k1 = kk[d * 4 + 1];
-                float k2 = kk[d * 4 + 2];
-                float k3 = kk[d * 4 + 3];
+                // k rows are padded to D+2 so the 4 dims load as 2 float2 reads
+                // (half the load-issue slots; the 2-way bank spread is hidden by
+                // the 2-cycle LDS.64 = same smem cycles as 4 scalar LDS.32).
+                float2 k01 = kk[d * 2 + 0];
+                float2 k23 = kk[d * 2 + 1];
+                float k0 = k01.x, k1 = k01.y, k2 = k23.x, k3 = k23.y;
                 float4 a0 = q0[d], a1 = q1[d], a2 = q2[d], a3 = q3[d];
-                d0 += a0.x * k0 + a0.y * k1 + a0.z * k2 + a0.w * k3;
-                d1 += a1.x * k0 + a1.y * k1 + a1.z * k2 + a1.w * k3;
-                d2 += a2.x * k0 + a2.y * k1 + a2.z * k2 + a2.w * k3;
-                d3 += a3.x * k0 + a3.y * k1 + a3.z * k2 + a3.w * k3;
+                d0a += a0.x * k0;  d0b += a0.y * k1;
+                d0c += a0.z * k2;  d0d += a0.w * k3;
+                d1a += a1.x * k0;  d1b += a1.y * k1;
+                d1c += a1.z * k2;  d1d += a1.w * k3;
+                d2a += a2.x * k0;  d2b += a2.y * k1;
+                d2c += a2.z * k2;  d2d += a2.w * k3;
+                d3a += a3.x * k0;  d3b += a3.y * k1;
+                d3c += a3.z * k2;  d3d += a3.w * k3;
             }
             float acc = 0.0f;
+            float d0 = (d0a + d0b) + (d0c + d0d);
+            float d1 = (d1a + d1b) + (d1c + d1d);
+            float d2 = (d2a + d2b) + (d2c + d2d);
+            float d3 = (d3a + d3b) + (d3c + d3d);
             if (d0 > 0.0f) acc += d0;   // ReLU per head
             if (d1 > 0.0f) acc += d1;
             if (d2 > 0.0f) acc += d2;
@@ -351,8 +367,9 @@ __global__ void indexer_score_kernel(
                 #pragma unroll 4
                 for (int d = 0; d < D4; ++d) {
                     float4 a = qh[d];
-                    dot += a.x * kk[d * 4 + 0] + a.y * kk[d * 4 + 1]
-                         + a.z * kk[d * 4 + 2] + a.w * kk[d * 4 + 3];
+                    float2 k01 = kk[d * 2 + 0], k23 = kk[d * 2 + 1];
+                    dot += a.x * k01.x + a.y * k01.y
+                         + a.z * k23.x + a.w * k23.y;
                 }
                 if (dot > 0.0f) acc += dot;   // ReLU
             }
@@ -879,7 +896,7 @@ std::vector<torch::Tensor> qsa_indexer_forward(
         int D4 = D / 4;
         int HqD4 = Hq * D4;
         int smem_bytes = SCORE_CQ * HqD4 * (int)sizeof(float4)
-                       + SCORE_CB * (D + 1) * (int)sizeof(float);
+                       + SCORE_CB * (D + 2) * (int)sizeof(float);
         // Larger query tiles can push past the 48KB default; opt in (A800 max 164KB).
         if (smem_bytes > 48 * 1024) {
             cudaFuncSetAttribute(indexer_score_kernel,
