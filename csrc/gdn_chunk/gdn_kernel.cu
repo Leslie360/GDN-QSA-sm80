@@ -2412,7 +2412,7 @@ extern "C" void gdn_chunk_forward_colsplit(
     }
 }
 
-// CHUNK=32 prepare-only (debug: validate the block-Schur workspace in isolation).
+// CHUNK=32 prepare-only (validates the block-Schur workspace in isolation).
 extern "C" void gdn_chunk_prepare_only32(
     const cutlass::bfloat16_t* q, const cutlass::bfloat16_t* k,
     const cutlass::bfloat16_t* v, const cutlass::bfloat16_t* g,

@@ -40,7 +40,7 @@ def qsa_expand(block_idx, block_size):
         sel_idx: [B, S, NMAX] int32, sel_cnt: [B, S] int32.
     """
     block_idx = block_idx.contiguous()
-    return _qsa_core.debug_expand(block_idx, block_size)
+    return _qsa_core.expand_blocks(block_idx, block_size)
 
 
 def qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, block_size):

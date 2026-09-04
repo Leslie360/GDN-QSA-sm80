@@ -40,11 +40,16 @@ for the published head dimensions and SM80, not locked to any single model.
 
 ## Install
 
+Source build only (no wheels provided):
+
 ```bash
-pip install -e .          # python package (CUDA ext compiled per-operator as it lands)
+export TORCH_CUDA_ARCH_LIST=8.0
+pip install -e . --no-build-isolation
 ```
 
-Requires: CUDA ≥ 12.0, `sm_80` target, PyTorch with CUDA.
+Requires: CUDA ≥ 12.0, `sm_80` target (A800), PyTorch with CUDA, and a C++17
+compiler. The extension is compiled in-place; `gdn_qsa_sm80.*_cuda` `.so` files
+appear under the package after a successful build.
 
 ## Usage
 
@@ -116,10 +121,10 @@ for `qsa_indexer`. Full methodology:
 
 | S | ours (ms) | fla (ms) | speedup |
 |---|---|---|---|
-| 2048 | 0.464 | 0.699 | 1.51x |
-| 4096 | 0.567 | 0.697 | 1.23x |
-| 8192 | 1.011 | 1.209 | 1.20x |
-| 32768 | 2.907 | 4.772 | 1.64x |
+| 2048 | 0.467 | 0.671 | 1.44x |
+| 4096 | 0.566 | 0.681 | 1.20x |
+| 8192 | 1.013 | 1.199 | 1.18x |
+| 32768 | 2.910 | 4.755 | 1.63x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
@@ -127,19 +132,24 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.304 | 0.883 | 2.90x |
-| 2048 | 0.583 | 0.884 | 1.51x |
-| 8192 | 5.456 | 3.362 | 0.62x |
+| 512 | 0.247 | 0.882 | 3.57x |
+| 2048 | 0.582 | 0.890 | 1.53x |
+| 8192 | 5.453 | 3.383 | 0.62x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
+
+> `qsa_indexer` is optimized for short/medium sequences; at `S=8192` the current
+> CUDA path is bandwidth-bound (dense `[S,NB]` score matrix) and slower than the
+> vectorized eager baseline. Tracked as future work — the kernel does not
+> advertise a long-sequence win.
 
 ### output_gate (bf16, G=4096 → O=2560)
 
 | T | gate (ms) | proj self (ms) | proj cutlass (ms) | cutlass speedup |
 |---|---|---|---|---|
-| 512 | 0.012 | 0.280 | 0.088 | 3.19x |
+| 512 | 0.011 | 0.279 | 0.087 | 3.19x |
 | 2048 | 0.036 | 0.730 | 0.215 | 3.40x |
-| 8192 | 0.128 | 2.750 | 0.825 | 3.34x |
+| 8192 | 0.128 | 2.505 | 0.678 | 3.69x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_output_gate.py`
 
@@ -148,10 +158,13 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_output_gate.py`
 | S | scalar (ms) | TC pass2 (ms) | speedup |
 |---|---|---|---|
 | 512 | 1.39 | 0.85 | 1.63x |
-| 2048 | 17.25 | 9.18 | 1.88x |
-| 8192 | 91.17 | 62.32 | 1.46x |
+| 2048 | 15.51 | 9.19 | 1.69x |
+| 8192 | 91.17 | 62.36 | 1.46x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
+
+All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
+[`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md).
 
 ## Related work
 

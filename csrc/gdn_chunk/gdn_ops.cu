@@ -157,8 +157,8 @@ extern "C" void gdn_scan_stage2(
     int B, int H,
     cudaStream_t stream);
 
-// Debug: run only the prepare kernel and return the workspace tensors.
-std::vector<torch::Tensor> debug_prepare(
+// Run only the prepare kernel and return the workspace tensors.
+std::vector<torch::Tensor> prepare_workspace(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     torch::Tensor beta) {
     int B = q.size(0);
@@ -206,8 +206,8 @@ std::vector<torch::Tensor> debug_prepare(
     return {ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk};
 }
 
-// Debug: run only the CHUNK=32 prepare kernel and return its workspace.
-std::vector<torch::Tensor> debug_prepare32(
+// Run only the CHUNK=32 prepare kernel and return its workspace.
+std::vector<torch::Tensor> prepare_workspace32(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
     torch::Tensor beta) {
     int B = q.size(0);
@@ -357,7 +357,7 @@ std::vector<torch::Tensor> forward_gdn_chunk(
     return {out, final_state};
 }
 
-// Debug entry: force CHUNK=32 (for validating the specialization in isolation).
+// Force CHUNK=32 specialization.
 std::vector<torch::Tensor> forward_gdn_chunk32(
     torch::Tensor q, torch::Tensor k, torch::Tensor v,
     torch::Tensor g, torch::Tensor beta, bool output_final_state) {
@@ -522,7 +522,7 @@ std::vector<torch::Tensor> forward_gdn_chunk_colsplit(
 // Stage 1 (superchunk affine scan): group transfer. Reads the CHUNK=16 prepare
 // workspace (ws_kd/ws_kr/ws_gt/ws_inv) plus raw v/beta and produces the per-group
 // transfer matrices A_g/B_g [num_groups*B*H, D, D] bf16 each.
-// v must be [B,S,Hv,D], beta [B,S,Hv] (raw inputs), ws from debug_prepare.
+// v must be [B,S,Hv,D], beta [B,S,Hv] (raw inputs), ws from prepare_workspace.
 std::vector<torch::Tensor> stage1_group_transfer(
     torch::Tensor ws_kd, torch::Tensor ws_kr, torch::Tensor ws_gt,
     torch::Tensor ws_inv,
@@ -611,92 +611,6 @@ std::vector<torch::Tensor> stage1_reset(
     return {B_g, metric};
 }
 
-// Debug: also return the internal diagnostic scalars (max|P|,max|R|,max|v*beta|,
-// max|A|,max|B| after chunk 0, for (seq=0,head=0,group=0)).
-std::vector<torch::Tensor> stage1_group_transfer_dbg(
-    torch::Tensor ws_kd, torch::Tensor ws_kr, torch::Tensor ws_gt,
-    torch::Tensor ws_inv,
-    torch::Tensor v, torch::Tensor beta,
-    int64_t group_chunks) {
-
-    const int CK = 16;
-    const int HD = 128;
-    int B = v.size(0);
-    int S = v.size(1);
-    int H = v.size(2);
-    auto v_c = v.contiguous();
-    auto beta_hm = beta.permute({2, 0, 1}).reshape({H, B * S}).contiguous();
-    int chunks_per_seq = (S + CK - 1) / CK;
-    int num_groups = (chunks_per_seq + int(group_chunks) - 1) / int(group_chunks);
-    int total_groups = B * H * num_groups;
-    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(v.device());
-    auto A_g = torch::zeros({int64_t(total_groups), HD, HD}, opts_bf16);
-    auto B_g = torch::zeros({int64_t(total_groups), HD, HD}, opts_bf16);
-    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(v.device());
-    auto dbg = torch::zeros({8}, opts_f32);
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    gdn_scan_stage1(
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_kd.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_kr.data_ptr()),
-        reinterpret_cast<const float*>(ws_gt.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_inv.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(v_c.data_ptr()), H * D,
-        reinterpret_cast<const cutlass::bfloat16_t*>(beta_hm.data_ptr()), B * S,
-        reinterpret_cast<cutlass::bfloat16_t*>(A_g.data_ptr()),
-        reinterpret_cast<cutlass::bfloat16_t*>(B_g.data_ptr()),
-        reinterpret_cast<float*>(dbg.data_ptr()),
-        nullptr,
-        CK * D, CK * CK, D,
-        S, H, B, chunks_per_seq, int(group_chunks), stream.stream());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {A_g, B_g, dbg};
-}
-
-// Debug: also return the FULL internal tensors for (seq=0,head=0,group=0):
-//   dbg_full = [P(C*D) | R(C*D) | tmpA(C*D) | tmpB(C*D) | A(D*D) | B(D*D)] f32
-// (dump taken after chunk 0 of that group).
-std::vector<torch::Tensor> stage1_group_transfer_dump(
-    torch::Tensor ws_kd, torch::Tensor ws_kr, torch::Tensor ws_gt,
-    torch::Tensor ws_inv,
-    torch::Tensor v, torch::Tensor beta,
-    int64_t group_chunks) {
-
-    const int CK = 16;
-    const int HD = 128;
-    int B = v.size(0);
-    int S = v.size(1);
-    int H = v.size(2);
-    auto v_c = v.contiguous();
-    auto beta_hm = beta.permute({2, 0, 1}).reshape({H, B * S}).contiguous();
-    int chunks_per_seq = (S + CK - 1) / CK;
-    int num_groups = (chunks_per_seq + int(group_chunks) - 1) / int(group_chunks);
-    int total_groups = B * H * num_groups;
-    auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(v.device());
-    auto A_g = torch::zeros({int64_t(total_groups), HD, HD}, opts_bf16);
-    auto B_g = torch::zeros({int64_t(total_groups), HD, HD}, opts_bf16);
-    int n_full = int(group_chunks) * (4 * CK * HD + 2 * HD * HD);
-    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(v.device());
-    auto dbg_full = torch::zeros({n_full}, opts_f32);
-
-    auto stream = at::cuda::getCurrentCUDAStream();
-    gdn_scan_stage1(
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_kd.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_kr.data_ptr()),
-        reinterpret_cast<const float*>(ws_gt.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(ws_inv.data_ptr()),
-        reinterpret_cast<const cutlass::bfloat16_t*>(v_c.data_ptr()), H * D,
-        reinterpret_cast<const cutlass::bfloat16_t*>(beta_hm.data_ptr()), B * S,
-        reinterpret_cast<cutlass::bfloat16_t*>(A_g.data_ptr()),
-        reinterpret_cast<cutlass::bfloat16_t*>(B_g.data_ptr()),
-        nullptr,
-        reinterpret_cast<float*>(dbg_full.data_ptr()),
-        CK * D, CK * CK, D,
-        S, H, B, chunks_per_seq, int(group_chunks), stream.stream());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {A_g, B_g, dbg_full};
-}
-
 // Stage 2: one Hillis-Steele round (low-level, for testing).
 // A_g/B_g are [B*H*G, D, D] bf16 row-major; dst may alias src (ping-pong).
 void stage2_round(
@@ -743,7 +657,7 @@ void stage2_scan(torch::Tensor A_g, torch::Tensor B_g, int64_t G) {
     }
 }
 
-// Stage 3: parallel group replay. ws = [kd,qd,kr,gt,inv,mqk] from debug_prepare,
+// Stage 3: parallel group replay. ws = [kd,qd,kr,gt,inv,mqk] from prepare_workspace,
 // prefix_B [B*H*G, D, D] bf16 from stage2_scan, v/beta raw inputs.
 // Returns out [B,S,H,D] and final_state [B,H,D,D].
 std::vector<torch::Tensor> stage3_replay(
@@ -1070,22 +984,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "GDN chunk forward (column-split)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
           py::arg("beta"), py::arg("output_final_state"), py::arg("split") = 4);
-    m.def("debug_prepare", &debug_prepare, "Debug: prepare kernel workspace");
-    m.def("debug_prepare32", &debug_prepare32, "Debug: CHUNK=32 prepare kernel workspace");
+    m.def("prepare_workspace", &prepare_workspace,
+          "Run the prepare kernel and return the workspace tensors",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"));
+    m.def("prepare_workspace32", &prepare_workspace32,
+          "CHUNK=32 prepare workspace",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"), py::arg("beta"));
     m.def("stage1_group_transfer", &stage1_group_transfer,
           "Stage 1: group transfer A_g/B_g from workspace + raw v/beta",
           py::arg("ws_kd"), py::arg("ws_kr"), py::arg("ws_gt"), py::arg("ws_inv"),
           py::arg("v"), py::arg("beta"), py::arg("group_chunks"));
-    m.def("stage1_group_transfer_dbg", &stage1_group_transfer_dbg,
-          "Stage 1 debug: also return diagnostic scalars",
-          py::arg("ws_kd"), py::arg("ws_kr"), py::arg("ws_gt"), py::arg("ws_inv"),
-          py::arg("v"), py::arg("beta"), py::arg("group_chunks"));
     m.def("stage1_reset", &stage1_reset,
           "Stage 1 reset fast path: B_g-only + decay-bound metric",
-          py::arg("ws_kd"), py::arg("ws_kr"), py::arg("ws_gt"), py::arg("ws_inv"),
-          py::arg("v"), py::arg("beta"), py::arg("group_chunks"));
-    m.def("stage1_group_transfer_dump", &stage1_group_transfer_dump,
-          "Stage 1 debug: also return full intermediate tensors for group 0",
           py::arg("ws_kd"), py::arg("ws_kr"), py::arg("ws_gt"), py::arg("ws_inv"),
           py::arg("v"), py::arg("beta"), py::arg("group_chunks"));
     m.def("stage2_round", &stage2_round, "Stage 2: one Hillis-Steele round",

@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(NumThreads) gdn_scan_stage1_kernel(
                      smem_thr_store_C_T.partition_D(local_tile(B_T, make_shape(Int<16>{}, Int<16>{}), make_coord(w, n))));
             }
         }
-        // global debug after chunk 0 Phase D: max|A| and max|B| over smem state
+        // global check after chunk 0 Phase D: max|A| and max|B| over smem state
         __syncthreads();
         if (lc == 0 && seq == 0 && head == 0 && group == 0 && tid == 0 && dbg_out != nullptr) {
             float mA = 0, mB = 0;

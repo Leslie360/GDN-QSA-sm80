@@ -10,7 +10,7 @@ void launch_qsa_core(const T* q, const T* k, const T* v, const int* block_idx,
                      T* out, int* sel_idx_buf, int* sel_cnt_buf,
                      int B, int S, int H, int KVH, int KB, int r, int D,
                      cudaStream_t stream);
-void launch_expand_debug(const int* block_idx, int* sel_idx, int* sel_cnt,
+void launch_expand(const int* block_idx, int* sel_idx, int* sel_cnt,
                          int B, int S, int KB, int r, cudaStream_t stream);
 }
 
@@ -87,8 +87,8 @@ torch::Tensor qsa_sparse_core_attention(
     return out;
 }
 
-// Debug helper: run pass 1 (expand) only, return sel_idx and sel_cnt.
-std::vector<torch::Tensor> debug_expand(torch::Tensor block_idx, int64_t block_size) {
+// Pass 1 (expand) only: return sel_idx and sel_cnt.
+std::vector<torch::Tensor> expand_blocks(torch::Tensor block_idx, int64_t block_size) {
     const at::cuda::OptionalCUDAGuard guard(block_idx.device());
     auto bi_c = block_idx.contiguous();
     int B = bi_c.size(0), S = bi_c.size(1), KB = bi_c.size(2), r = (int)block_size;
@@ -96,7 +96,7 @@ std::vector<torch::Tensor> debug_expand(torch::Tensor block_idx, int64_t block_s
     auto sel_idx = torch::empty({B, S, NMAX}, bi_c.options().dtype(at::kInt));
     auto sel_cnt = torch::empty({B, S}, bi_c.options().dtype(at::kInt));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    qsa_core::launch_expand_debug(bi_c.data_ptr<int>(), sel_idx.data_ptr<int>(),
+    qsa_core::launch_expand(bi_c.data_ptr<int>(), sel_idx.data_ptr<int>(),
                                   sel_cnt.data_ptr<int>(), B, S, KB, r, stream);
     return {sel_idx, sel_cnt};
 }
@@ -104,5 +104,5 @@ std::vector<torch::Tensor> debug_expand(torch::Tensor block_idx, int64_t block_s
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &qsa_sparse_core_attention,
           "QSA sparse core attention (sparse paged softmax over selected KV)");
-    m.def("debug_expand", &debug_expand, "pass 1 expand debug");
+    m.def("expand_blocks", &expand_blocks, "pass 1 block expansion (sel_idx, sel_cnt)");
 }

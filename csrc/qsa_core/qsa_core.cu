@@ -543,8 +543,8 @@ void launch_qsa_core(const T* q, const T* k, const T* v, const int* block_idx,
     }
 }
 
-// Debug helper: run pass 1 (expand) only, returning sel_idx and sel_cnt.
-void launch_expand_debug(const int* block_idx, int* sel_idx, int* sel_cnt,
+// Run pass 1 (expand) only, returning sel_idx and sel_cnt.
+void launch_expand(const int* block_idx, int* sel_idx, int* sel_cnt,
                          int B, int S, int KB, int r, cudaStream_t stream) {
     const int NMAX = KB * r + r;
     const int warps_per_block = 8;

@@ -6,13 +6,24 @@ fast-path / two-level paths.
 
 ## Algorithm
 
-GDN chunked delta-rule recurrence (per token `i`, head):
+Gated delta-rule recurrence over a per-head state matrix `S ∈ R^{D×D}`
+(`D` = head dim), per token `i`:
 
 ```
-decay g_i < 0 (natural log-decay: state *= exp(g_i))
-h_i = h_{i-1} * exp(g_i) + k_i^T (v_i - h_{i-1} k_i) * beta_i
-out_i = h_i q_i
+g_i < 0                                (log-decay; state scales by exp(g_i))
+S_i = exp(g_i) * S_{i-1} + beta_i * k_i^T @ (v_i - k_i @ S_{i-1})
+o_i = q_i @ S_i
 ```
+
+with `q_i, k_i ∈ R^{1×D}`, `v_i, o_i ∈ R^{1×D}`, `beta_i ∈ R`, and a per-row
+gate `beta_i ∈ [0,1]` controlling the write. Equivalently, the rank-1 update
+`(v_i - k_i S_{i-1})` is written with strength `beta_i` after decaying the
+state.
+
+> The CUDA kernel internally stores the state in a transposed MMA-friendly
+> physical layout; the public `final_state` output follows the logical `[D, D]`
+> convention (the host wrapper transposes on the way out). `q @ S` is the
+> row-vector form of the attention readout.
 
 Chunked form solves an intra-chunk lower-triangular system (via
 `solve_triangular`) for `v_new`, then a sequential inter-chunk recurrence over
