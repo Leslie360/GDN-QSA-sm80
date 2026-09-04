@@ -51,7 +51,7 @@ long-sequence fast path).
 |---|---|
 | date | 2026-09-05 |
 | machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util during some runs, numbers below are the consistent (GPU0) medians |
-| tree state | commits `3dfef2f` (round-2 slab narrowing) + `df5311f` (encode vectorize) + `07a6838` (pool vectorize) + `253f0d8` (score invisible-tile exit) + `02daf87` (score float2+acc) + `7a418db` (topk pack-all) |
+| tree state | commits `3dfef2f` (round-2 slab narrowing) + `df5311f` (encode vectorize) + `07a6838` (pool vectorize) + `253f0d8` (score invisible-tile exit) + `02daf87` (score float2+acc) + `7a418db` (topk pack-all) + `873b6e9` (SCORE_CQ 8) + `46c1670` (cp.async q) + `a5edc90` (topk pack+hist fuse) |
 | build command | `ENV=... CUDA_HOME=$ENV PATH=$ENV/bin:$PATH GDN_QSA_BUILD_OPS=qsa_indexer bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
 | correctness | **37/37 PASS** |
 
@@ -74,25 +74,30 @@ long-sequence fast path).
   causal mask fully hides write `-inf` and return before staging (skips the
   global loads + barrier that ~half the blocks wasted); key rows padded to
   `D+2` load 4 dims as 2 float2 reads (half the load-issue slots), and each
-  head's dot uses independent accumulators.  score 1.47 → ~1.0-1.2 ms.
-- **topk: pack-all candidates.**  Dense compaction's single `atomicAdd` counter
-  (contended by all 512 threads) is replaced by fixed-position packing with a
-  `NEG_INF_KEY` sentinel; `P`/`K_eff` come from a thread-0 pivot walk.
+  head's dot uses independent accumulators.  score 1.47 → ~1.0 ms.
+- **score: cp.async query staging + SCORE_CQ=8 tile.**  The query tile is
+  staged with `cp.async` (committed, waited at the compute barrier) so its
+  copies overlap the block-key staging; halving the query tile keeps 3 blocks
+  resident.  Together these take score from ~1.2ms to ~1.0ms (S=8192).
+- **topk: pack-all candidates + fused pack+hist.**  Dense compaction's single
+  `atomicAdd` counter is replaced by fixed-position packing with a
+  `NEG_INF_KEY` sentinel; `P`/`K_eff` come from a thread-0 pivot walk, and the
+  pack+hist share one pass over the global scores.  topk ~0.81 → ~0.65 ms.
 - Host now requires D=128, R=64 (the production indexer shapes).
 
 ### qsa_indexer vs vectorized eager (fp32, Hq=4/D=128/R=64/r=4/KB=512)
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.052 | 0.877 | 16.9x |
-| 2048 | 0.269 | 0.879 | 3.27x |
-| 8192 | 2.082 | 3.364 | 1.62x |
+| 512 | 0.046 | 0.875 | 19.0x |
+| 2048 | 0.260 | 0.882 | 3.39x |
+| 8192 | 1.974 | 3.371 | 1.71x |
 
-At S=8192 the remaining time is score kernel ~1.0-1.2ms + topk ~0.66-0.79ms
-(both near the scalar roofline: the score kernel is load-issue bound on a 48KB
-tile, and the TopK final sort is a 45-stage bitonic of the ~K winners).  A
-tensor-core score with fp32-emulation, a fused score+radix kernel, or a
-non-bitonic final sort are the documented next steps.
+At S=8192 the remaining time is score kernel ~1.0ms + topk ~0.65ms (both near
+the scalar roofline: the score kernel is load-issue bound on a ~33KB tile, and
+the TopK final sort is a 45-stage bitonic of the ~K winners).  A tensor-core
+score with fp32-emulation, a fused score+radix kernel, or a non-bitonic final
+sort are the documented next steps.
 
 ---
 

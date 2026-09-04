@@ -191,14 +191,14 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.052 | 0.877 | 16.9x |
-| 2048 | 0.269 | 0.879 | 3.27x |
-| 8192 | 2.082 | 3.364 | 1.62x |
+| 512 | 0.046 | 0.875 | 19.0x |
+| 2048 | 0.260 | 0.882 | 3.39x |
+| 8192 | 1.974 | 3.371 | 1.71x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
 
 The two-stage path (pool → encode → tiled score → per-query TopK) beats the
-vectorized eager baseline at every length, including `S=8192` (`1.62x`).  The
+vectorized eager baseline at every length, including `S=8192` (`1.71x`).  The
 wins come from SM80-scalar work-splitting and sorting:
 
 - **Coalesced preprocess kernels.** The pool-keys and encode kernels each run
@@ -208,11 +208,12 @@ wins come from SM80-scalar work-splitting and sorting:
   thread-per-row versions read rows strided `D` floats apart (~2–3% coalescing)
   and under-filled the GPU at short lengths — pool 117→9 µs, encode 349→27 µs
   at `S=8192`, and `S=512` dropped ~6× overall.
-- **Score kernel: invisible-tile early exit + float2 key reads.** Tiles the
-  causal mask fully hides now write `-inf` and return before staging (skips the
-  global loads + barrier); key rows padded to `D+2` load the 4 dims as 2 float2
-  reads instead of 4 scalar `LDS.32` (half the load-issue slots), and each
-  head's dot uses independent accumulators to shorten the FMA chains.
+- **Score kernel: invisible-tile early exit + cp.async staging + float2 keys.**
+  Tiles the causal mask fully hides now write `-inf` and return before staging
+  (skips the global loads + barrier); the query tile is staged with `cp.async`
+  so its copies overlap the block-key staging; a `SCORE_CQ=8` tile keeps 3
+  blocks resident; key rows padded to `D+2` load 4 dims as 2 float2 reads
+  (half the load-issue slots) with independent per-head accumulators.
 - **TopK round-2 slab narrowing.** The `==pivot` slab of the radix select is
   narrowed one byte at a time (CUB `block_topk_air` style) instead of a full
   `O(eq_n log² eq_n)` bitonic sort; once it fits one warp it is sorted in
