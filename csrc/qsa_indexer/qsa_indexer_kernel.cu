@@ -381,37 +381,126 @@ __global__ void indexer_topk_kernel(
         }
         __syncthreads();
 
-        // ---- round 2: sort the ==b1 slab, keep top `need` ----
-        // (hist[b1] is tiny for uniform data, so this is a cheap exact sort.)
-        int eq_n = seq_cnt;
-        int P2e = 1;
-        while (P2e < eq_n) P2e <<= 1;
-        for (int i = eq_n + threadIdx.x; i < P2e; i += blockDim.x) {
-            s_pack[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
-        }
-        __syncthreads();
-        for (int k = 2; k <= P2e; k <<= 1) {
-            for (int j = k >> 1; j > 0; j >>= 1) {
-                for (int i = threadIdx.x; i < P2e; i += blockDim.x) {
-                    int l = i ^ j;
-                    if (l > i) {
-                        bool up = ((i & k) == 0);
-                        uint64_t a = s_pack[i];
-                        uint64_t b = s_pack[l];
-                        if ((up && a < b) || (!up && b < a)) {
-                            s_pack[i] = b;
-                            s_pack[l] = a;
+        // ---- round 2: narrow the ==b1 slab, then warp-shuffle-sort it ----
+        //
+        // The ==b1 slab can be large (ReLU scores cluster in a few exponent
+        // buckets, so hist[b1] ~ hundreds) but we only need its top-`rem`
+        // elements.  Sorting the whole slab is O(eq_n log^2 eq_n) bitonic work;
+        // instead, narrow it one 8-bit byte at a time (CUB block_topk_air
+        // style): each round histograms the current byte of the CANDIDATE
+        // slab, collects everything above the pivot bucket as final winners,
+        // and keeps only the ==pivot elements as the next, smaller slab.
+        // Real ReLU scores spread over ~256 sub-buckets in the second byte, so
+        // one round shrinks the slab from ~400 to a handful; once the slab fits
+        // one warp (<=32) it is sorted entirely in registers with warp-shuffle
+        // bitonic (no barriers, no shared-memory round trips).  Since the
+        // reversed index fills the low 32 bits of the packed key, equal scores
+        // tie-break by lowest block index, matching the reference.  The final
+        // bitonic below orders all K_eff winners anyway.
+        //
+        // The shrinking slab ping-pongs between the low and high halves of
+        // s_pack so compaction never reads and writes the same slot.
+        int n = seq_cnt;               // current slab size
+        int src = 0;                   // current slab base in s_pack
+        int dst = P_pad >> 1;          // compaction target base
+        int rem = sneed;               // still need `rem` winners from the slab
+        if (n > P_pad / 2) {
+            // Degenerate: slab too large for the half-and-half scheme.  This
+            // can only happen with extreme tie clustering; fall back to the
+            // exact full-slab bitonic for this query.
+            n = seq_cnt;
+            int P2e = 1;
+            while (P2e < n) P2e <<= 1;
+            for (int i = n + threadIdx.x; i < P2e; i += blockDim.x) {
+                s_pack[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
+            }
+            __syncthreads();
+            for (int k = 2; k <= P2e; k <<= 1) {
+                for (int j = k >> 1; j > 0; j >>= 1) {
+                    for (int i = threadIdx.x; i < P2e; i += blockDim.x) {
+                        int l = i ^ j;
+                        if (l > i) {
+                            bool up = ((i & k) == 0);
+                            uint64_t a = s_pack[i];
+                            uint64_t b = s_pack[l];
+                            if ((up && a < b) || (!up && b < a)) {
+                                s_pack[i] = b;
+                                s_pack[l] = a;
+                            }
                         }
+                    }
+                    __syncthreads();
+                }
+            }
+            for (int j = threadIdx.x; j < sneed; j += blockDim.x) {
+                s_out[scnt_gt + j] = s_pack[j];
+            }
+            __syncthreads();
+        } else {
+            __shared__ int s_owin;   // winners appended after cnt_gt
+            if (threadIdx.x == 0) s_owin = 0;
+            __syncthreads();
+            int byte = 48;
+            while (n > 32 && byte >= 0 && rem > 0) {
+                for (int i = threadIdx.x; i < 256; i += blockDim.x) s_hist[i] = 0;
+                __syncthreads();
+                for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                    atomicAdd(&s_hist[(int)((s_pack[src + i] >> byte) & 0xFFu)], 1);
+                }
+                __syncthreads();
+                __shared__ int sb2, sneed2;
+                if (threadIdx.x == 0) {
+                    int cnt = 0;
+                    int b2 = 0;
+                    for (int b = 255; b >= 0; --b) {
+                        int c = s_hist[b];
+                        if (cnt + c >= rem) { b2 = b; sneed2 = rem - cnt; break; }
+                        cnt += c;
+                    }
+                    sb2 = b2;
+                }
+                __syncthreads();
+                __shared__ int s_keep;   // compaction counter into `dst`
+                if (threadIdx.x == 0) s_keep = 0;
+                __syncthreads();
+                for (int i = threadIdx.x; i < n; i += blockDim.x) {
+                    uint64_t pk = s_pack[src + i];
+                    int d = (int)((pk >> byte) & 0xFFu);
+                    if (d > sb2) {
+                        s_out[scnt_gt + atomicAdd(&s_owin, 1)] = pk;   // final winner
+                    } else if (d == sb2) {
+                        s_pack[dst + atomicAdd(&s_keep, 1)] = pk;      // next slab
+                    }
+                }
+                __syncthreads();
+                n = s_keep;
+                int tmp = src; src = dst; dst = tmp;
+                rem = sneed2;
+                byte -= 8;
+            }
+            // The slab now fits one warp: warp-shuffle bitonic (descending) on
+            // the full packed key; lanes 0..rem-1 are the final winners.
+            if (rem > 0) {
+                uint64_t v = (threadIdx.x < n) ? s_pack[src + threadIdx.x]
+                                              : ((uint64_t)0x007FFFFFu << 32);
+                if (threadIdx.x < 32) {
+                    for (int k = 2; k <= 32; k <<= 1) {
+                        for (int j = k >> 1; j >= 1; j >>= 1) {
+                            uint64_t o = __shfl_xor_sync(0xFFFFFFFFu, v, j);
+                            bool up = ((threadIdx.x & k) == 0);
+                            uint64_t lo = (v < o) ? v : o;
+                            uint64_t hi = (v < o) ? o : v;
+                            bool lower = ((threadIdx.x & j) == 0);
+                            v = lower ? (up ? hi : lo) : (up ? lo : hi);
+                        }
+                    }
+                    if (threadIdx.x < rem) {
+                        s_out[scnt_gt + s_owin + threadIdx.x] = v;   // desc order kept
                     }
                 }
                 __syncthreads();
             }
         }
-        // append the top `need` of the sorted slab after the >b1 winners
-        for (int j = threadIdx.x; j < sneed; j += blockDim.x) {
-            s_out[scnt_gt + j] = s_pack[j];
-        }
-        __syncthreads();
 
         // ---- bitonic sort (descending) of the EXACTLY K_eff winners ----
         int P2s = 1;
