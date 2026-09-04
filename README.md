@@ -1,4 +1,4 @@
-# gdn-qsa-sm80
+# GDN-QSA-sm80
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![tests](https://img.shields.io/badge/tests-33%2F33-brightgreen)](docs/VALIDATION_LOG.md)
