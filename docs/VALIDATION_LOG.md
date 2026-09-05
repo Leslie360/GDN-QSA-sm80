@@ -62,7 +62,7 @@ amortizes over larger ones.  GC=32 for S in (4096, 16384], GC=64 elsewhere.
 |---|---|
 | date | 2026-09-05 |
 | machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util (GPU0 medians below) |
-| tree state | commits `fab936d` (fuse P+plsum) + `819872a` (mma swizzle) + `ae0137b` (union_tok OOB fix) + `f816194` (dispatch gate) + `2407a34` (docs) |
+| tree state | commits `fab936d` (fuse P+plsum) + `819872a` (mma swizzle) + `ae0137b` (union_tok OOB fix) + `f816194` (dispatch gate) + `c886399` (PV hoist) + `41445f5` (QK hoist) + `6085bb7` (softmax token hoist) + `4d9f4d2` (gather16) + `18cb987` (drop prof) + `2407a34` (docs) |
 | build command | `GDN_QSA_BUILD_OPS=qsa_pass2_tc bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
 | correctness | **37/37 PASS** (full suite) + reuse recent/random all-S PASS + dense-union S=8188/4092 PASS |
 
@@ -94,9 +94,16 @@ Release-bench row (same clean GPU0, `benchmarks/bench_qsa_core.py`, mean n=10):
 
 | S | scalar (ms) | v3 `qsa_pass2_tc` (ms) | reuse `qsa_pass2_tc_reuse` (ms) | v3 vs scalar | reuse vs v3 | reuse vs scalar |
 |---|---|---|---|---|---|---|
-| 512 | 1.39 | 0.36 | 0.40* | 3.89x | 0.89x | 3.47x |
-| 2048 | 15.58 | 3.86 | 3.34 | 4.03x | 1.16x | 4.67x |
-| 8192 | 91.19 | 25.94 | 20.85 | 3.52x | **1.24x** | 4.37x |
+| 512 | 1.39 | 0.36 | 0.36* | 3.88x | 1.00x | 3.89x |
+| 2048 | 16.38 | 3.85 | 2.09 | 4.25x | **1.85x** | 7.85x |
+| 8192 | 91.12 | 25.91 | 12.88 | 3.52x | **2.01x** | **7.07x** |
+
+`*` S=512 is within noise of v3 (reuse pays its union-build overhead only for
+long sequences), so the `qsa_pass2_tc_reuse` auto-dispatch is gated to
+`1024 ≤ S ≤ 8192` (commit `f816194`); below that it routes to v3.  relL1 vs
+scalar 1.6e-3 (unchanged), 37/37 tests PASS.  (Rejected during the session:
+pad-row-skip — consistently ~0.2ms slower; tmax-barrier merge — reading
+`pmax[8]` per thread costs ~3000x the barrier saving.)
 
 `*` S=512 is within noise of v3 (reuse pays its union-build overhead only for
 long sequences), so the `qsa_pass2_tc_reuse` auto-dispatch is gated to

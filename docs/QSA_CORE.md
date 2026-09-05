@@ -23,8 +23,8 @@ all-warp QK, `kPitch=264` to eliminate 8-way bank conflicts, `__launch_bounds__(
 for 2 CTA/SM occupancy, and a distributed online softmax (cells spread across
 lanes + 8-lane `__shfl_xor` reduction) that removed a 32x cross-lane
 redundancy. bf16, `D=256` only. TC pass2 (v3) vs scalar (current bench,
-`benchmarks/bench_qsa_core.py`): S=8192 **91.19ms → 25.94ms (3.52x)**,
-S=2048 15.58ms → 3.86ms (4.03x), S=512 1.39ms → 0.36ms (3.89x).
+`benchmarks/bench_qsa_core.py`): S=8192 **91.12ms → 25.91ms (3.52x)**,
+S=2048 16.38ms → 3.85ms (4.25x), S=512 1.39ms → 0.36ms (3.88x).
 
 **TC pass2 reuse**: groups `M_TILE=4` adjacent queries per CTA, builds the union
 of their selected token sets in shared memory (a `bitmap`+`atomicOr` union, no
@@ -32,11 +32,15 @@ preprocessing kernel), then streams the union in 64-token tiles — each gathere
 K/V tile is shared by all four queries (reuse analysis
 `tools/analyze_qsa_core_reuse.py`: ~90% of the gather L2 traffic is shared across
 adjacent queries). On top of the union-sharing it
-(a) fuses the softmax P/plsum into a single barrier and
+(a) fuses the softmax P/plsum into a single barrier,
 (b) swizzles the Q/K/P smem layouts (`swz16(j)=(j&7)*2+(j>>3)`) so each mma
 A/B fragment register (columns j and j+8) loads with one LDS.32 instead of two
-scattered LDS.32. `nPitch=72` gives the PV A-fragment a full 32-bank spread.
-S=8192 **20.85ms (4.37x over scalar, 1.24x over v3)**, S=2048 3.34ms (4.67x).
+scattered LDS.32 (`nPitch=72` gives the PV A-fragment a full 32-bank spread),
+(c) hoists the PV/QK fragment loads and the softmax token/ownership reads out
+of the per-query loops (the mma B operands and `union_tok`/`qmap` are
+qq-invariant), and (d) gathers 16 cols/thread so swz pairs store as `uint32`.
+S=8192 **12.88ms (7.07x over scalar, 2.01x over v3)**, S=2048 2.09ms (7.85x
+over scalar, 1.85x over v3).
 Dispatched only when `1024 ≤ S ≤ 8192` and `S % 4 == 0`; below S=1024 the
 union-build overhead does not pay off (S=512 is within noise of v3), so it
 falls back to v3.
