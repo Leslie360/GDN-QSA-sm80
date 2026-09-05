@@ -180,12 +180,18 @@ for `qsa_indexer`. Full methodology:
 
 | S | ours (ms) | fla (ms) | speedup |
 |---|---|---|---|
-| 2048 | 0.467 | 0.671 | 1.44x |
-| 4096 | 0.566 | 0.681 | 1.20x |
-| 8192 | 1.013 | 1.199 | 1.18x |
-| 32768 | 2.910 | 4.755 | 1.63x |
+| 2048 | 0.464 | 0.675 | 1.45x |
+| 4096 | 0.566 | 0.676 | 1.19x |
+| 8192 | 0.893 | 1.199 | 1.34x |
+| 32768 | 2.910 | 4.702 | 1.62x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
+
+`gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by decay
+strength and sequence length, and the superchunk group size is swept per `S`
+(the serial per-group replay chain shortens with smaller groups while the
+cross-group scan amortizes over larger ones): `GC=32` for the `8192..16384`
+band, `GC=64` elsewhere.  At `S=8192` this is `1.013→0.893ms` (1.18x→1.34x).
 
 ### qsa_indexer (vs vectorized eager, fp32, Hq=4/D=128/R=64/r=4/KB=512)
 
