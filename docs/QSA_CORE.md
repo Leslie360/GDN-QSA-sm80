@@ -22,8 +22,9 @@ From-scratch SM80 sparse attention over the indexer-selected blocks. Three paths
 all-warp QK, `kPitch=264` to eliminate 8-way bank conflicts, `__launch_bounds__(256,2)`
 for 2 CTA/SM occupancy, and a distributed online softmax (cells spread across
 lanes + 8-lane `__shfl_xor` reduction) that removed a 32x cross-lane
-redundancy. bf16, `D=256` only. TC pass2 vs scalar: S=8192 **91.36ms → 25.38ms
-(3.60x)**, S=2048 3.86ms (4.47x), S=512 0.37ms (3.79x).
+redundancy. bf16, `D=256` only. TC pass2 (v3) vs scalar (current bench,
+`benchmarks/bench_qsa_core.py`): S=8192 **91.19ms → 25.94ms (3.52x)**,
+S=2048 15.58ms → 3.86ms (4.03x), S=512 1.39ms → 0.36ms (3.89x).
 
 **TC pass2 reuse**: groups `M_TILE=4` adjacent queries per CTA, builds the union
 of their selected token sets in shared memory (a `bitmap`+`atomicOr` union, no
