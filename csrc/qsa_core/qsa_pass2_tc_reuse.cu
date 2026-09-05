@@ -124,10 +124,12 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     sp += S * sizeof(unsigned char);
     int* u_cnt = reinterpret_cast<int*>(sp);                              // union length
     sp += sizeof(int);
-    short* union_tok = reinterpret_cast<short*>(sp);                      // [UMAX] int16
-    sp += (size_t)UMAX * sizeof(short);
-    // (query-ownership is read live from qmap[token]; no [UMAX] qmask copy —
-    //  saves 8KB smem, keeps us under the 166912B limit with nPitch=72.)
+    // [UMAX + N_TILE] int16: +N_TILE padding so the last streaming tile (which
+    // reads all 64 slots of a partial tile, tbase_last+63 possibly > UMAX when
+    // S%64 != 0) stays in-bounds.  (query-ownership is read live from qmap[token];
+    // no [UMAX] qmask copy — saves 8KB smem, keeps us under 166912B with nPitch=72.)
+    short* union_tok = reinterpret_cast<short*>(sp);
+    sp += (size_t)(UMAX + N_TILE) * sizeof(short);
 
     // ---- stage Q: M_TILE queries x 16 rows (12 real + 4 pad) ----
     for (int e = tid; e < M_TILE * M16 * D; e += 256) {
@@ -171,7 +173,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     }
     __syncthreads();
     const int U = *u_cnt;
-    for (int e = tid + U; e < UMAX; e += 256) union_tok[e] = -1;
+    for (int e = tid + U; e < UMAX + N_TILE; e += 256) union_tok[e] = -1;
     __syncthreads();
 
     // ---- online-softmax state per query (O in registers, 16 f32 per query) ----
@@ -398,7 +400,7 @@ void launch_qsa_pass2_tc_reuse(const __nv_bfloat16* q, const __nv_bfloat16* k,
                                  + ((S + 31) / 32) * sizeof(unsigned int)
                                  + S
                                  + sizeof(int)
-                                 + (size_t)UMAX * sizeof(short));
+                                 + (size_t)(UMAX + N_TILE) * sizeof(short));
     long long total_groups = (long long)B * S / M_TILE;
     int nblocks = (int)(total_groups * KVH);
     auto kern = qsa_pass2_tc_reuse_kernel;
