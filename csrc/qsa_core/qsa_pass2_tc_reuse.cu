@@ -271,7 +271,11 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         }
         __syncthreads();
 
-        // ---- 5) P + plsum + sm_l: all queries, shared barriers ----
+        // ---- 5) fused P + plsum + sm_l: ONE barrier (P smem round-trip for
+        //      plsum eliminated — the 8-lane shuffle reduce runs on the p value
+        //      still in registers; PV reads P (needs the barrier), but neither
+        //      PV nor anything else reads sm_l/plsum, so sm_l update is fused in
+        //      with no extra barrier). ----
         for (int qq = 0; qq < M_TILE; qq++) {
             const int s_qq = s0 + qq;
             const float* Scq = Sc + qq * M16 * nPitch;
@@ -283,17 +287,9 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                 int tok = union_tok[tbase + m];
                 bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmask[tbase + m] & (1u << qq));
                 float p = ok ? __expf(Scq[r * nPitch + m] - sm_m[qq * M16 + r]) : 0.f;
+                float pb = b2f(f2b(p));   // match PV's bf16 operands exactly
                 if (m < N_TILE) Pq[r * nPitch + m] = f2b(p);
-            }
-        }
-        __syncthreads();
-        for (int qq = 0; qq < M_TILE; qq++) {
-            const __nv_bfloat16* Pq = P + qq * M16 * nPitch;
-#pragma unroll
-            for (int it = 0; it < 4; it++) {
-                int e = it * 32 + lane;
-                int r = e / 8; int c = e % 8; int m = warp * 8 + c;
-                float pv = (m < N_TILE) ? b2f(Pq[r * nPitch + m]) : 0.f;
+                float pv = pb;
                 pv += __shfl_xor_sync(0xffffffffu, pv, 1);
                 pv += __shfl_xor_sync(0xffffffffu, pv, 2);
                 pv += __shfl_xor_sync(0xffffffffu, pv, 4);
@@ -311,7 +307,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                     sm_l[qq * M16 + r] += lt;
                 }
             }
-        __syncthreads();
 
         // ---- 6) TC PV: all queries, one barrier ----
         for (int qq = 0; qq < M_TILE; qq++) {
