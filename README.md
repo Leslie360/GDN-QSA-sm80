@@ -21,11 +21,12 @@ kernels and reproducible benchmarks against public baselines.
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
 >
-> **v0.2.1**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
-> S=8192 is 12.88ms (2.01x over the TC pass2, 7.07x over scalar).
+> **v0.2.2**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
+> S=8192 is 11.50ms (2.26x over the TC pass2, 7.93x over scalar).
 
 ## News
 
+- **2026.09.06 · v0.2.2** — perf release: `qsa_core` reuse kernel inner-loop fusion — row-max merged into QK (register scores) and rescale fused into P (drops the `sm_l` barrier) — S=8192 12.88→**11.50ms**, now **2.26×** over the per-query TC pass-2 and **7.93×** over scalar.
 - **2026.09.06 · v0.2.1** — perf release: `qsa_core` reuse kernel round-2 optimizations (loop-invariant fragment/token hoists, mma-fragment smem swizzle, 16-col uint32 gathers) — S=8192 20.85→12.88ms, now **2.01×** over the per-query TC pass-2 and **7.07×** over scalar; added `RELEASE_NOTES.md`.
 - **2026.09.05 · v0.2.0** — perf release: `qsa_indexer` radix-select TopK, beats vectorized eager at all lengths (1.71× at S=8192, 19× at S=512); `qsa_core` TC pass-2 v3 (3.52× vs scalar) + query-tile K/V reuse kernel (20.85 ms, 4.37× vs scalar at S=8192); `gdn_chunk` dynamic GC dispatch; tests 33→37.
 - **2026.09.04 · v0.1.0** — initial public release: all four operators shipped, 33/33 tests PASS, clean-A800 validation log.
@@ -44,7 +45,7 @@ Deliberately **out of scope** for this repo:
 
 ## Highlights
 
-- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar, reuse path 7.07×** — full reproduce commands in [Benchmarks](#benchmarks).
+- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar, reuse path 7.93×** — full reproduce commands in [Benchmarks](#benchmarks).
 - **From-scratch SM80 CUDA/CUTE** kernels (not Triton wrappers).
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
@@ -161,8 +162,8 @@ out = qsa_sparse_core_attention(q, k, v, block_idx, r)
 sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
 
-# query-tile local K/V reuse pass2 — ~2x faster than qsa_pass2_tc at
-# S=8192 (12.88ms vs 25.91ms): shares each gathered 64-token tile across 4
+# query-tile local K/V reuse pass2 — ~2.26x faster than qsa_pass2_tc at
+# S=8192 (11.50ms vs 25.91ms): shares each gathered 64-token tile across 4
 # adjacent queries, hoists loop-invariant fragment/token loads, and swizzles
 # Q/K/P smem so each mma A/B fragment register loads with a single LDS.32;
 # auto-falls back to v3 for S>8192.
@@ -266,11 +267,11 @@ adds query-tile local K/V reuse (auto-dispatched for `1024 ≤ S ≤ 8192`).
 |---|---|---|---|---|---|
 | 512 | 1.39 | 0.36 | 0.36 | 3.88x | 1.00x |
 | 2048 | 16.38 | 3.85 | 2.09 | 4.25x | 1.85x |
-| 8192 | 91.12 | 25.91 | 12.88 | 3.52x | **2.01x** |
+| 8192 | 91.12 | 25.91 | 11.50 | 3.52x | **2.26x** |
 
 Reuse is within noise of v3 at S=512 (its union-build overhead doesn't pay at
 short sequences), so the auto-dispatch falls back to v3 below S=1024.
-The S=8192 reuse path is 7.07x over scalar.
+The S=8192 reuse path is 7.93x over scalar.
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
 
@@ -287,14 +288,16 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 - `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.91ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
   groups four adjacent queries per CTA, builds the union of their selected token
-  sets in smem, and shares each gathered 64-token K/V tile — S=8192 **12.9ms
-  (2.01x over the per-query v3 path, 7.07x over scalar)**, S=2048 2.09ms (1.85x
+  sets in smem, and shares each gathered 64-token K/V tile — S=8192 **11.50ms
+  (2.26x over the per-query v3 path, 7.93x over scalar)**, S=2048 2.09ms (1.85x
   over v3). On top of the union-sharing it (a) fuses the softmax P/plsum into
   one barrier, (b) swizzles the Q/K/P smem layouts so each mma A/B fragment
   register (columns j and j+8) is one LDS.32 instead of two scattered LDS.32,
   (c) hoists the PV/QK fragment loads and the softmax token/ownership reads out
   of the per-query loops (the mma B operands and union_tok/qmap are
   qq-invariant), and (d) gathers 16 cols/thread so swz pairs store as uint32.
+  Round-2 fusion merges the softmax row-max into QK (register scores) and the
+  rescale into P (`mnew` phase, no `sm_l` barrier).
   Block-reuse analysis (`tools/analyze_qsa_core_reuse.py`) showed ~90% of the
   gather L2 traffic is shared across adjacent queries.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
