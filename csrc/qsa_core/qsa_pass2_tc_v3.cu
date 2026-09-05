@@ -22,6 +22,15 @@
 
 namespace qsa_pass2_tc_v3 {
 
+// query-tile local K/V reuse kernel (separate TU; auto-dispatched for S<=8192).
+namespace qsa_pass2_tc_reuse {
+void launch_qsa_pass2_tc_reuse(const __nv_bfloat16* q, const __nv_bfloat16* k,
+                               const __nv_bfloat16* v, const int* sel_idx,
+                               const int* sel_cnt, __nv_bfloat16* out,
+                               int B, int S, int H, int KVH, int NMAX,
+                               cudaStream_t stream);
+}
+
 __device__ __forceinline__ float b2f(__nv_bfloat16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ __nv_bfloat16 f2b(float x) { return __float2bfloat16(x); }
 __device__ __forceinline__ uint32_t pack2(__nv_bfloat16 lo, __nv_bfloat16 hi) {
@@ -331,8 +340,61 @@ torch::Tensor qsa_pass2_tc_v3(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     return out;
 }
 
+// Dispatch entry: query-tile local-reuse kernel for S<=8192 (S%M_TILE==0), else
+// the per-query v3 kernel.  Both produce the same sparse-core attention output;
+// reuse cuts the K/V gather L2 traffic ~4x by sharing each 64-token tile across
+// 4 adjacent queries (see qsa_pass2_tc_reuse.cu).
+torch::Tensor qsa_pass2_tc_reuse_entry(torch::Tensor q, torch::Tensor k, torch::Tensor v,
+                                       torch::Tensor sel_idx, torch::Tensor sel_cnt,
+                                       int64_t block_size) {
+    TORCH_CHECK(q.is_cuda());
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16, "TC path requires bf16");
+    const at::cuda::OptionalCUDAGuard guard(q.device());
+
+    auto qc = q.contiguous(); auto kc = k.contiguous(); auto vc = v.contiguous();
+    auto sic = sel_idx.contiguous(); auto scc = sel_cnt.contiguous();
+
+    int B = qc.size(0), S = qc.size(1), H = qc.size(2), Dd = qc.size(3);
+    int KVH = kc.size(2); int NMAX = sic.size(2);
+    TORCH_CHECK(Dd == D, "TC pass2 requires D=256");
+    auto out = torch::empty_like(qc);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const bool use_reuse = (S <= 8192) && (S % 4 == 0);
+    if (use_reuse) {
+        qsa_pass2_tc_reuse::launch_qsa_pass2_tc_reuse(
+            reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(kc.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(vc.data_ptr()),
+            sic.data_ptr<int>(), scc.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+            B, S, H, KVH, NMAX, stream);
+    } else {
+        float scale = 1.0f / sqrtf((float)D);
+        size_t smem_bytes = (size_t)((M16 + 2 * N_TILE) * kPitch * sizeof(__nv_bfloat16)
+                                     + M16 * nPitch * sizeof(float)
+                                     + M16 * nPitch * sizeof(__nv_bfloat16)
+                                     + N_TILE * sizeof(bool)
+                                     + 2 * M16 * 8 * sizeof(float) + 2 * M16 * sizeof(float));
+        long long total_ctas = (long long)B * S * KVH;
+        int nblocks = (int)total_ctas;
+        auto kern = qsa_pass2_tc_v3_kernel;
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+        kern<<<nblocks, 256, smem_bytes, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(kc.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(vc.data_ptr()),
+            sic.data_ptr<int>(), scc.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+            B, S, H, KVH, NMAX, scale);
+    }
+    return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qsa_pass2_tc_v3", &qsa_pass2_tc_v3::qsa_pass2_tc_v3, "v2 optimized pass2");
+    m.def("qsa_pass2_tc_reuse", &qsa_pass2_tc_v3::qsa_pass2_tc_reuse_entry,
+          "query-tile local K/V reuse pass2 (auto-dispatched, S<=8192)");
 }

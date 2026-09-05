@@ -105,12 +105,12 @@ if "qsa_core" in _ops:
         )
     )
 
-# qsa_pass2_tc — TC-accelerated pass2 (v3, bf16 D=256)
+# qsa_pass2_tc — TC-accelerated pass2 (v3, bf16 D=256) + query-tile reuse
 if "qsa_pass2_tc" in _ops:
     ext_modules.append(
         CUDAExtension(
             "gdn_qsa_sm80._qsa_pass2_tc",
-            _qc("qsa_pass2_tc_v3.cu"),
+            _qc("qsa_pass2_tc_v3.cu", "qsa_pass2_tc_reuse.cu"),
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-arch=sm_80"],

@@ -13,6 +13,7 @@ from .output_gate_interface import (
 from .qsa_core_interface import (
     qsa_expand,
     qsa_pass2_tc,
+    qsa_pass2_tc_reuse,
     qsa_sparse_core_attention,
 )
 from .qsa_indexer_interface import (
@@ -35,6 +36,7 @@ __all__ = [
     "qsa_sparse_core_attention",
     "qsa_expand",
     "qsa_pass2_tc",
+    "qsa_pass2_tc_reuse",
     # output gate
     "rmsnorm_gated",
     "out_proj_gemm",
