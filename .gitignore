@@ -20,3 +20,6 @@ __pycache__/
 
 # benchmark scratch
 benchmarks/_out/
+
+# build logs
+*.log
