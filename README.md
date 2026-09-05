@@ -248,9 +248,9 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_output_gate.py`
 
 | S | scalar (ms) | TC pass2 (ms) | speedup |
 |---|---|---|---|
-| 512 | 1.39 | 0.85 | 1.63x |
-| 2048 | 15.51 | 9.19 | 1.69x |
-| 8192 | 91.17 | 62.36 | 1.46x |
+| 512 | 1.39 | 0.37 | 3.79x |
+| 2048 | 17.28 | 3.86 | 4.47x |
+| 8192 | 91.36 | 25.38 | 3.60x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
 
@@ -260,12 +260,15 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 ## Roadmap
 
 - `qsa_indexer` now beats the vectorized eager baseline at all lengths, including
-  `S=8192` (1.47x), via coalesced preprocess kernels, a narrowing radix-select
+  `S=8192` (1.71x), via coalesced preprocess kernels, a narrowing radix-select
   TopK, and cross-query block-key reuse in the score kernel. Further gains would
   come from a fused score+radix kernel (single pass, no dense `[S,NB]`
   materialization) and tensor-core score with fp32-emulation precision.
-- `qsa_core` TC pass-2 is a documented ~1.5x win over scalar; further gains are
-  expected from a fused pass-1+pass-2 kernel.
+- `qsa_core` TC pass-2 is a documented 3.60x win over scalar (S=8192 25.4ms) after
+  the distributed-softmax fix; the next lever is query-tile local K/V reuse —
+  adjacent queries re-gather the same selected blocks (block reuse median ~1400+
+  queries), so a CTA serving a small query tile could cut the gather-bound L2
+  traffic roughly an order of magnitude.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
   (see Scope).
 

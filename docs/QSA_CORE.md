@@ -17,8 +17,12 @@ From-scratch SM80 sparse attention over the indexer-selected blocks. Two paths:
 **TC pass2 (v3)**: one-pass flash QK+PV via `mma.sync` m16n8k16, vectorized
 `uint4` K/V gather (8 bf16 per load — gather was the #1 bottleneck), `N_TILE=64`
 all-warp QK, `kPitch=264` to eliminate 8-way bank conflicts, `__launch_bounds__(256,2)`
-for 2 CTA/SM occupancy. bf16, `D=256` only. Reversed the TC vs scalar gap:
-S=8192 ~91ms → ~62ms (~1.46x).
+for 2 CTA/SM occupancy, and a distributed online softmax (cells spread across
+lanes + 8-lane `__shfl_xor` reduction) that removed a 32x cross-lane
+redundancy. bf16, `D=256` only. TC pass2 vs scalar: S=8192 **91.36ms → 25.38ms
+(3.60x)**, S=2048 3.86ms (4.47x), S=512 0.37ms (3.79x). The gather segment
+remains ~30% (L2-bandwidth-bound); query-tile local K/V reuse across adjacent
+queries is the documented next lever.
 
 ## Interface
 

@@ -67,9 +67,9 @@ on 5000 random inputs including heavy-tie / constant cases.
 
 | S | qsa_indexer (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.052 | 0.877 | 16.9x |
-| 2048 | 0.263 | 0.877 | 3.33x |
-| 8192 | 2.287 | 3.372 | **1.47x** |
+| 512 | 0.046 | 0.875 | 19.0x |
+| 2048 | 0.260 | 0.882 | 3.39x |
+| 8192 | 1.974 | 3.371 | **1.71x** |
 
 The two-stage path beats the vectorized eager baseline at every length,
 including `S=8192`.  The win comes from (1) coalesced one-warp-per-row
