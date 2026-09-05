@@ -154,6 +154,11 @@ out = qsa_sparse_core_attention(q, k, v, block_idx, r)
 # TC-accelerated pass2 (bf16, D=256)
 sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
+
+# query-tile local K/V reuse pass2 — ~1.10x faster than qsa_pass2_tc at
+# S=8192 (23.6ms vs 26.0ms) by sharing each gathered 64-token tile across
+# 4 adjacent queries; auto-falls back to the v3 kernel for S>8192.
+out_re = qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, r)
 ```
 
 See [`docs/QSA_CORE.md`](docs/QSA_CORE.md).
@@ -264,11 +269,13 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
   TopK, and cross-query block-key reuse in the score kernel. Further gains would
   come from a fused score+radix kernel (single pass, no dense `[S,NB]`
   materialization) and tensor-core score with fp32-emulation precision.
-- `qsa_core` TC pass-2 is a documented 3.60x win over scalar (S=8192 25.4ms) after
-  the distributed-softmax fix; the next lever is query-tile local K/V reuse —
-  adjacent queries re-gather the same selected blocks (block reuse median ~1400+
-  queries), so a CTA serving a small query tile could cut the gather-bound L2
-  traffic roughly an order of magnitude.
+- `qsa_core` TC pass-2 is a 3.51x win over scalar (S=8192 26.0ms). A query-tile
+  local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for S≤8192: it groups
+  four adjacent queries per CTA, builds the union of their selected token sets in
+  smem, and shares each gathered 64-token K/V tile — S=8192 23.6ms (1.10x over
+  the per-query v3 path, vs scalar 3.87x), with the softmax P/plsum fused into a
+  single barrier. Block-reuse analysis (`tools/analyze_qsa_core_reuse.py`) showed
+  ~90% of the gather L2 traffic is shared across adjacent queries.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
   (see Scope).
 
