@@ -158,7 +158,7 @@ sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
 
 # query-tile local K/V reuse pass2 — ~1.24x faster than qsa_pass2_tc at
-# S=8192 (20.9ms vs 26.0ms): shares each gathered 64-token tile across 4
+# S=8192 (20.85ms vs 25.94ms): shares each gathered 64-token tile across 4
 # adjacent queries, and swizzles Q/K/P smem so each mma A/B fragment
 # register loads with a single LDS.32; auto-falls back to v3 for S>8192.
 out_re = qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, r)
@@ -190,7 +190,7 @@ for `qsa_indexer`. Full methodology:
 |---|---|---|---|
 | 2048 | 0.464 | 0.675 | 1.45x |
 | 4096 | 0.566 | 0.676 | 1.19x |
-| 8192 | 0.893 | 1.199 | 1.34x |
+| 8192 | 0.895 | 1.197 | 1.34x |
 | 32768 | 2.910 | 4.702 | 1.62x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
@@ -199,7 +199,7 @@ Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 strength and sequence length, and the superchunk group size is swept per `S`
 (the serial per-group replay chain shortens with smaller groups while the
 cross-group scan amortizes over larger ones): `GC=32` for the `8192..16384`
-band, `GC=64` elsewhere.  At `S=8192` this is `1.013→0.893ms` (1.18x→1.34x).
+band, `GC=64` elsewhere.  At `S=8192` this is `1.013→0.895ms` (1.18x→1.34x).
 
 ### qsa_indexer (vs vectorized eager, fp32, Hq=4/D=128/R=64/r=4/KB=512)
 
@@ -279,7 +279,7 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
   TopK, and cross-query block-key reuse in the score kernel. Further gains would
   come from a fused score+radix kernel (single pass, no dense `[S,NB]`
   materialization) and tensor-core score with fp32-emulation precision.
-- `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.9ms). A query-tile
+- `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.94ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
   groups four adjacent queries per CTA, builds the union of their selected token
   sets in smem, and shares each gathered 64-token K/V tile — S=8192 20.85ms
