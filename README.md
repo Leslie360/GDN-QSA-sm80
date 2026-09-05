@@ -155,9 +155,10 @@ out = qsa_sparse_core_attention(q, k, v, block_idx, r)
 sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
 
-# query-tile local K/V reuse pass2 — ~1.10x faster than qsa_pass2_tc at
-# S=8192 (23.6ms vs 26.0ms) by sharing each gathered 64-token tile across
-# 4 adjacent queries; auto-falls back to the v3 kernel for S>8192.
+# query-tile local K/V reuse pass2 — ~1.24x faster than qsa_pass2_tc at
+# S=8192 (20.9ms vs 26.0ms): shares each gathered 64-token tile across 4
+# adjacent queries, and swizzles Q/K/P smem so each mma A/B fragment
+# register loads with a single LDS.32; auto-falls back to v3 for S>8192.
 out_re = qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, r)
 ```
 
@@ -272,10 +273,13 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 - `qsa_core` TC pass-2 is a 3.51x win over scalar (S=8192 26.0ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for S≤8192: it groups
   four adjacent queries per CTA, builds the union of their selected token sets in
-  smem, and shares each gathered 64-token K/V tile — S=8192 23.6ms (1.10x over
-  the per-query v3 path, vs scalar 3.87x), with the softmax P/plsum fused into a
-  single barrier. Block-reuse analysis (`tools/analyze_qsa_core_reuse.py`) showed
-  ~90% of the gather L2 traffic is shared across adjacent queries.
+  smem, and shares each gathered 64-token K/V tile — S=8192 20.9ms (1.24x over
+  the per-query v3 path, vs scalar 4.37x). On top of the union-sharing it (a)
+  fuses the softmax P/plsum into one barrier and (b) swizzles the Q/K/P smem
+  layouts so each mma A/B fragment register (columns j and j+8) is one LDS.32
+  instead of two scattered LDS.32. Block-reuse analysis
+  (`tools/analyze_qsa_core_reuse.py`) showed ~90% of the gather L2 traffic is
+  shared across adjacent queries.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
   (see Scope).
 
