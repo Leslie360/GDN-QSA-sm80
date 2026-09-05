@@ -1,4 +1,4 @@
-# Release Notes — gdn-qsa-sm80 v0.1.0
+# Release Notes — gdn-qsa-sm80 v0.2.1
 
 **Date**: 2026-09-06
 **GPU**: NVIDIA A800-SXM4-80GB (SM80/Ampere)
@@ -33,7 +33,7 @@ swizzles the Q/K/P smem layouts for single-LDS mma fragments, hoists all
 loop-invariant fragment/token loads out of the per-query loops, and gathers
 16 cols/thread with paired uint32 stores.
 
-**Other operators** (S=8192): `gdn_chunk` 0.893ms vs fla 1.199ms (1.34x);
+**Other operators** (S=8192): `gdn_chunk` 0.895ms vs fla 1.197ms (1.34x);
 `qsa_indexer` 1.974ms vs vectorized eager 3.371ms (1.71x, all lengths);
 `output_gate` cutlass proj 0.678ms vs self-written 2.505ms (3.69x).
 

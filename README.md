@@ -21,11 +21,12 @@ kernels and reproducible benchmarks against public baselines.
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
 >
-> **v0.1.0**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
+> **v0.2.1**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
 > S=8192 is 12.88ms (2.01x over the TC pass2, 7.07x over scalar).
 
 ## News
 
+- **2026.09.06 · v0.2.1** — perf release: `qsa_core` reuse kernel round-2 optimizations (loop-invariant fragment/token hoists, mma-fragment smem swizzle, 16-col uint32 gathers) — S=8192 20.85→12.88ms, now **2.01×** over the per-query TC pass-2 and **7.07×** over scalar; added `RELEASE_NOTES.md`.
 - **2026.09.05 · v0.2.0** — perf release: `qsa_indexer` radix-select TopK, beats vectorized eager at all lengths (1.71× at S=8192, 19× at S=512); `qsa_core` TC pass-2 v3 (3.52× vs scalar) + query-tile K/V reuse kernel (20.85 ms, 4.37× vs scalar at S=8192); `gdn_chunk` dynamic GC dispatch; tests 33→37.
 - **2026.09.04 · v0.1.0** — initial public release: all four operators shipped, 33/33 tests PASS, clean-A800 validation log.
 
@@ -43,7 +44,7 @@ Deliberately **out of scope** for this repo:
 
 ## Highlights
 
-- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar** (reuse path 4.37×) — full reproduce commands in [Benchmarks](#benchmarks).
+- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar, reuse path 7.07×** — full reproduce commands in [Benchmarks](#benchmarks).
 - **From-scratch SM80 CUDA/CUTE** kernels (not Triton wrappers).
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
@@ -160,10 +161,11 @@ out = qsa_sparse_core_attention(q, k, v, block_idx, r)
 sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
 
-# query-tile local K/V reuse pass2 — ~1.24x faster than qsa_pass2_tc at
-# S=8192 (20.85ms vs 25.94ms): shares each gathered 64-token tile across 4
-# adjacent queries, and swizzles Q/K/P smem so each mma A/B fragment
-# register loads with a single LDS.32; auto-falls back to v3 for S>8192.
+# query-tile local K/V reuse pass2 — ~2x faster than qsa_pass2_tc at
+# S=8192 (12.88ms vs 25.91ms): shares each gathered 64-token tile across 4
+# adjacent queries, hoists loop-invariant fragment/token loads, and swizzles
+# Q/K/P smem so each mma A/B fragment register loads with a single LDS.32;
+# auto-falls back to v3 for S>8192.
 out_re = qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, r)
 ```
 
