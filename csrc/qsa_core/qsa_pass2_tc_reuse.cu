@@ -259,6 +259,16 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         __syncthreads();
 
         // ---- 3) row-max + tmax: all queries, shared barriers ----
+        // union_tok/qmap are qq-invariant (only the `1<<qq` bit test differs) —
+        // hoist the token + ownership reads out of the qq loop.
+        int tok[4]; unsigned char qm[4];
+#pragma unroll
+        for (int it = 0; it < 4; it++) {
+            int e = it * 32 + lane;
+            int m = warp * 8 + (e % 8);
+            tok[it] = union_tok[tbase + m];
+            qm[it] = (tok[it] >= 0) ? qmap[tok[it]] : 0;
+        }
         for (int qq = 0; qq < M_TILE; qq++) {
             const int s_qq = s0 + qq;
             const float* Scq = Sc + qq * M16 * nPitch;
@@ -266,8 +276,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             for (int it = 0; it < 4; it++) {
                 int e = it * 32 + lane;
                 int r = e / 8; int c = e % 8; int m = warp * 8 + c;
-                int tok = union_tok[tbase + m];
-                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmap[tok] & (1u << qq));
+                bool ok = (m < N_TILE) && (tok[it] >= 0) && (tok[it] <= s_qq) && (qm[it] & (1u << qq));
                 float val = ok ? Scq[r * nPitch + m] : -1e30f;
                 val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 1));
                 val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 2));
@@ -308,6 +317,14 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         //      still in registers; PV reads P (needs the barrier), but neither
         //      PV nor anything else reads sm_l/plsum, so sm_l update is fused in
         //      with no extra barrier). ----
+        int ptok[4]; unsigned char pqm[4];
+#pragma unroll
+        for (int it = 0; it < 4; it++) {
+            int e = it * 32 + lane;
+            int m = warp * 8 + (e % 8);
+            ptok[it] = union_tok[tbase + m];
+            pqm[it] = (ptok[it] >= 0) ? qmap[ptok[it]] : 0;
+        }
         for (int qq = 0; qq < M_TILE; qq++) {
             const int s_qq = s0 + qq;
             const float* Scq = Sc + qq * M16 * nPitch;
@@ -316,8 +333,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             for (int it = 0; it < 4; it++) {
                 int e = it * 32 + lane;
                 int r = e / 8; int c = e % 8; int m = warp * 8 + c;
-                int tok = union_tok[tbase + m];
-                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmap[tok] & (1u << qq));
+                bool ok = (m < N_TILE) && (ptok[it] >= 0) && (ptok[it] <= s_qq) && (pqm[it] & (1u << qq));
                 float p = ok ? __expf(Scq[r * nPitch + m] - sm_m[qq * M16 + r]) : 0.f;
                 float pb = b2f(f2b(p));   // match PV's bf16 operands exactly
                 if (m < N_TILE) Pq[r * nPitch + swz_d(m)] = f2b(p);
