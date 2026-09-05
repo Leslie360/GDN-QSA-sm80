@@ -334,25 +334,41 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
 
         // ---- 6) TC PV: all queries, one barrier ----
+        // Fragment operands are loop-invariant in a way the compiler cannot
+        // always CSE under register pressure: P (A operand) is identical across
+        // the 4 oc iterations, and V (B operand) is identical across the 4 qq
+        // iterations.  Hoist both explicitly — 512 -> 128 LDS per thread/tile
+        // (A: 4kt x 4 x 4qq = 64, B: 4oc x 4kt x 2 = 32).
+        uint32_t Vf[4][4][2];
+        for (int oc = 0; oc < 4; oc++) {
+            const int dg = warp * 32 + oc * 8 + gi;
+#pragma unroll
+            for (int kt = 0; kt < N_TILE / K16; kt++) {
+                const int ko = kt * K16;
+                Vf[oc][kt][0] = pack2(Vsm[(ko + li) * kPitch + dg],      Vsm[(ko + li + 8) * kPitch + dg]);
+                Vf[oc][kt][1] = pack2(Vsm[(ko + li + 4) * kPitch + dg],  Vsm[(ko + li + 12) * kPitch + dg]);
+            }
+        }
         for (int qq = 0; qq < M_TILE; qq++) {
             const __nv_bfloat16* Pq = P + qq * M16 * nPitch;
+            uint32_t Af[4][4];
+#pragma unroll
+            for (int kt = 0; kt < N_TILE / K16; kt++) {
+                const int ko = kt * K16;
+                // token-swizzled P: mma A register pair (token j, j+8) at
+                // (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
+                Af[kt][0] = ld32(&Pq[gi * nPitch + ko + 2 * li]);
+                Af[kt][1] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li]);
+                Af[kt][2] = ld32(&Pq[gi * nPitch + ko + 2 * li + 8]);
+                Af[kt][3] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li + 8]);
+            }
             for (int oc = 0; oc < 4; oc++) {
                 float o0v[4] = {0.f, 0.f, 0.f, 0.f};
                 float o1v[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
                 for (int kt = 0; kt < N_TILE / K16; kt++) {
-                    const int ko = kt * K16;
-                    const int dg = warp * 32 + oc * 8 + gi;
-                    uint32_t a[4];
-                    // token-swizzled P: mma A register pair (token j, j+8) at
-                    // (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
-                    a[0] = ld32(&Pq[gi * nPitch + ko + 2 * li]);
-                    a[1] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li]);
-                    a[2] = ld32(&Pq[gi * nPitch + ko + 2 * li + 8]);
-                    a[3] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li + 8]);
-                    uint32_t bb[2];
-                    bb[0] = pack2(Vsm[(ko + li) * kPitch + dg],      Vsm[(ko + li + 8) * kPitch + dg]);
-                    bb[1] = pack2(Vsm[(ko + li + 4) * kPitch + dg],  Vsm[(ko + li + 12) * kPitch + dg]);
+                    uint32_t a[4] = {Af[kt][0], Af[kt][1], Af[kt][2], Af[kt][3]};
+                    uint32_t bb[2] = {Vf[oc][kt][0], Vf[oc][kt][1]};
                     if (kt & 1) mma16n8k16(o1v, a, bb); else mma16n8k16(o0v, a, bb);
                 }
                 o0v[0] += o1v[0]; o0v[1] += o1v[1]; o0v[2] += o1v[2]; o0v[3] += o1v[3];
