@@ -144,9 +144,12 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
         }
         __syncthreads();
 
-        // ---- 2) QK mma: warp w owns N-column [w*8, w*8+8); warps 0-3 active ----
+        // ---- 2) QK mma: warp w owns N-column [w*8, w*8+8).  Two accumulators
+        //      interleave the 16 serial mma.sync chains (each waits ~2 dozen
+        //      cycles on the previous accumulator), hiding the latency. ----
         if (warp < 8) {
-            float s_c[4] = {0.f, 0.f, 0.f, 0.f};
+            float s0[4] = {0.f, 0.f, 0.f, 0.f};
+            float s1[4] = {0.f, 0.f, 0.f, 0.f};
             const int colw = warp * 8;
 #pragma unroll
             for (int kb = 0; kb < D / K16; kb++) {
@@ -159,13 +162,14 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
                 uint32_t bb[2];
                 bb[0] = pack2(Ksm[(colw + gi) * kPitch + ko + li],     Ksm[(colw + gi) * kPitch + ko + li + 8]);
                 bb[1] = pack2(Ksm[(colw + gi) * kPitch + ko + li + 4], Ksm[(colw + gi) * kPitch + ko + li + 12]);
-                mma16n8k16(s_c, a, bb);
+                if (kb & 1) mma16n8k16(s1, a, bb); else mma16n8k16(s0, a, bb);
             }
-            s_c[0] *= scale; s_c[1] *= scale; s_c[2] *= scale; s_c[3] *= scale;
-            Sc[gi * nPitch + colw + 2 * li]     = s_c[0];
-            Sc[gi * nPitch + colw + 2 * li + 1] = s_c[1];
-            Sc[(gi + 8) * nPitch + colw + 2 * li]     = s_c[2];
-            Sc[(gi + 8) * nPitch + colw + 2 * li + 1] = s_c[3];
+            s0[0] += s1[0]; s0[1] += s1[1]; s0[2] += s1[2]; s0[3] += s1[3];
+            s0[0] *= scale; s0[1] *= scale; s0[2] *= scale; s0[3] *= scale;
+            Sc[gi * nPitch + colw + 2 * li]     = s0[0];
+            Sc[gi * nPitch + colw + 2 * li + 1] = s0[1];
+            Sc[(gi + 8) * nPitch + colw + 2 * li]     = s0[2];
+            Sc[(gi + 8) * nPitch + colw + 2 * li + 1] = s0[3];
         }
         __syncthreads();
 
@@ -248,7 +252,8 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
 
         // ---- 6) TC PV: all 8 warps split D into 8 slices of 32; read full P ----
         for (int oc = 0; oc < 4; oc++) {
-            float o_c[4] = {0.f, 0.f, 0.f, 0.f};
+            float o0[4] = {0.f, 0.f, 0.f, 0.f};
+            float o1[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int kt = 0; kt < N_TILE / K16; kt++) {
                 const int ko = kt * K16;
@@ -261,12 +266,13 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
                 uint32_t bb[2];
                 bb[0] = pack2(Vsm[(ko + li) * kPitch + dg],      Vsm[(ko + li + 8) * kPitch + dg]);
                 bb[1] = pack2(Vsm[(ko + li + 4) * kPitch + dg],  Vsm[(ko + li + 12) * kPitch + dg]);
-                mma16n8k16(o_c, a, bb);
+                if (kt & 1) mma16n8k16(o1, a, bb); else mma16n8k16(o0, a, bb);
             }
-            O_r[0][oc * 2 + 0] += o_c[0];
-            O_r[0][oc * 2 + 1] += o_c[1];
-            O_r[1][oc * 2 + 0] += o_c[2];
-            O_r[1][oc * 2 + 1] += o_c[3];
+            o0[0] += o1[0]; o0[1] += o1[1]; o0[2] += o1[2]; o0[3] += o1[3];
+            O_r[0][oc * 2 + 0] += o0[0];
+            O_r[0][oc * 2 + 1] += o0[1];
+            O_r[1][oc * 2 + 0] += o0[2];
+            O_r[1][oc * 2 + 1] += o0[3];
         }
         __syncthreads();
     }
