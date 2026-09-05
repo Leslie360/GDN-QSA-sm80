@@ -1,4 +1,4 @@
-# Release Notes — gdn-qsa-sm80 v0.2.1
+# Release Notes — gdn-qsa-sm80 v0.2.2
 
 **Date**: 2026-09-06
 **GPU**: NVIDIA A800-SXM4-80GB (SM80/Ampere)
