@@ -284,7 +284,7 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
   TopK, and cross-query block-key reuse in the score kernel. Further gains would
   come from a fused score+radix kernel (single pass, no dense `[S,NB]`
   materialization) and tensor-core score with fp32-emulation precision.
-- `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.94ms). A query-tile
+- `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.91ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
   groups four adjacent queries per CTA, builds the union of their selected token
   sets in smem, and shares each gathered 64-token K/V tile — S=8192 **12.9ms
