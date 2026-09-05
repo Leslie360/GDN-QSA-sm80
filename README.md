@@ -1,7 +1,7 @@
 # GDN-QSA-sm80
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![tests](https://img.shields.io/badge/tests-33%2F33-brightgreen)](docs/VALIDATION_LOG.md)
+[![tests](https://img.shields.io/badge/tests-37%2F37-brightgreen)](docs/VALIDATION_LOG.md)
 
 From-scratch **SM80 (A100/A800) CUDA/CUTE** kernels for the **GDN (Gated DeltaNet)**
 and **QSA (query-key sparse attention)** attention operators.
@@ -23,6 +23,7 @@ kernels and reproducible benchmarks against public baselines.
 
 ## News
 
+- **2026.09.05 · v0.2.0** — perf release: `qsa_indexer` radix-select TopK, beats vectorized eager at all lengths (1.71× at S=8192, 19× at S=512); `qsa_core` TC pass-2 v3 (3.52× vs scalar) + query-tile K/V reuse kernel (20.85 ms, 4.37× vs scalar at S=8192); `gdn_chunk` dynamic GC dispatch; tests 33→37.
 - **2026.09.04 · v0.1.0** — initial public release: all four operators shipped, 33/33 tests PASS, clean-A800 validation log.
 
 ## Scope
@@ -39,7 +40,7 @@ Deliberately **out of scope** for this repo:
 
 ## Highlights
 
-- **gdn_chunk up to 1.63× vs fla** (S=32K, bf16, A800); **qsa_core TC pass-2 1.5–1.7× vs scalar** — full reproduce commands in [Benchmarks](#benchmarks).
+- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar** (reuse path 4.37×) — full reproduce commands in [Benchmarks](#benchmarks).
 - **From-scratch SM80 CUDA/CUTE** kernels (not Triton wrappers).
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
@@ -51,7 +52,7 @@ Deliberately **out of scope** for this repo:
 | Operator | Component | Target | Dtypes | Notes |
 |---|---|---|---|---|
 | `gdn_chunk` | Gated DeltaNet (linear attention) | SM80 (A100/A800) | bf16 | serial / reset-fast-path / two-level scan, auto-dispatch by S |
-| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | SM80 | fp32 | short/medium S; S≥8192 bandwidth-bound (see [Benchmarks](#benchmarks)) |
+| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | SM80 | fp32 | two-stage path beats vectorized eager at all S (see [Benchmarks](#benchmarks)) |
 | `output_gate` | Gated residual output gate | SM80 | bf16 | RMSNormGated + CUTLASS GEMM |
 | `qsa_core` | QSA sparse-block attention | SM80 | scalar: all / TC: bf16 | TC pass-2 requires D=256 |
 
