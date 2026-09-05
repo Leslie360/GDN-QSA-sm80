@@ -55,9 +55,10 @@ def qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, block_size):
 def qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, block_size):
     """TC pass2 with query-tile local K/V reuse (auto-dispatched).
 
-    Same math as :func:`qsa_pass2_tc` (v3 fallback for S > 8192 or S % 4 != 0),
-    but for S <= 8192 groups 4 adjacent queries per CTA and shares the union of
-    their selected K/V tiles (cuts gather L2 traffic ~4x). bf16, D=256 only.
+    Same math as :func:`qsa_pass2_tc` (v3 fallback for S < 1024, S > 8192, or
+    S % 4 != 0). For 1024 <= S <= 8192 it groups 4 adjacent queries per CTA and
+    shares the union of their selected K/V tiles (cuts gather L2 traffic ~4x;
+    at S=8192 ~1.24x over v3). bf16, D=256 only.
     """
     q, k, v, sel_idx, sel_cnt = (x.contiguous() for x in (q, k, v, sel_idx, sel_cnt))
     return _qsa_pass2_tc.qsa_pass2_tc_reuse(q, k, v, sel_idx, sel_cnt, block_size)

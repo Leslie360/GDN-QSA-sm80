@@ -360,7 +360,10 @@ torch::Tensor qsa_pass2_tc_reuse_entry(torch::Tensor q, torch::Tensor k, torch::
     auto out = torch::empty_like(qc);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    const bool use_reuse = (S <= 8192) && (S % 4 == 0);
+    // reuse pays for its union-build overhead only for long sequences: at S=512
+    // it is within noise of v3, so gate it to S>=1024 (clean A800 median-of-30:
+    // S=1024 0.84x, S=2048 0.70x, S=8192 0.80x of v3).
+    const bool use_reuse = (S >= 1024) && (S <= 8192) && (S % 4 == 0);
     if (use_reuse) {
         qsa_pass2_tc_reuse::launch_qsa_pass2_tc_reuse(
             reinterpret_cast<const __nv_bfloat16*>(qc.data_ptr()),
