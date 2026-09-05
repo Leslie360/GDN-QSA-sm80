@@ -69,9 +69,8 @@ public config `H=24, KVH=2, D=256, KB=512, r=4`.
 
 ## Bench
 
-`python benchmarks/bench_qsa_core.py` — scalar vs TC pass2 at
-`S ∈ {512, 2048, 8192}` (public config `H=24/KVH=2/D=256/KB=512/r=4`).
-The reuse path is benchmarked by `tools/verify_reuse.py`.
+`python benchmarks/bench_qsa_core.py` — scalar vs TC pass2 v3 vs TC pass2 reuse
+at `S ∈ {512, 2048, 8192}` (public config `H=24/KVH=2/D=256/KB=512/r=4`).
 
 ## Reproduce
 
@@ -79,4 +78,5 @@ The reuse path is benchmarked by `tools/verify_reuse.py`.
 pip install -e .                 # builds _qsa_core + _qsa_pass2_tc
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/test_qsa_core.py -x
 CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py
+CUDA_VISIBLE_DEVICES=0 python tools/verify_reuse.py   # reuse correctness + quick perf
 ```
