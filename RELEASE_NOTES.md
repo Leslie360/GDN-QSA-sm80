@@ -25,7 +25,7 @@ auto-dispatched for `1024 ≤ S ≤ 8192`) vs the per-query TC pass2:
 | S | scalar (ms) | TC pass2 v3 (ms) | TC pass2 reuse (ms) | reuse vs v3 | reuse vs scalar |
 |---|---|---|---|---|---|
 | 2048 | 16.38 | 3.85 | 2.09 | 1.85x | 7.85x |
-| 8192 | 91.12 | 25.91 | 12.88 | **2.01x** | **7.07x** |
+| 8192 | 91.12 | 25.91 | 11.50 | **2.26x** | **7.93x** |
 
 The reuse kernel groups 4 adjacent queries per CTA, shares each gathered
 64-token K/V tile across them, fuses the softmax P/plsum into one barrier,

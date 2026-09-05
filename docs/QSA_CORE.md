@@ -39,7 +39,7 @@ scattered LDS.32 (`nPitch=72` gives the PV A-fragment a full 32-bank spread),
 (c) hoists the PV/QK fragment loads and the softmax token/ownership reads out
 of the per-query loops (the mma B operands and `union_tok`/`qmap` are
 qq-invariant), and (d) gathers 16 cols/thread so swz pairs store as `uint32`.
-S=8192 **12.88ms (7.07x over scalar, 2.01x over v3)**, S=2048 2.09ms (7.85x
+S=8192 **11.50ms (7.93x over scalar, 2.26x over v3)**, S=2048 2.09ms (7.85x
 over scalar, 1.85x over v3).
 Dispatched only when `1024 ≤ S ≤ 8192` and `S % 4 == 0`; below S=1024 the
 union-build overhead does not pay off (S=512 is within noise of v3), so it

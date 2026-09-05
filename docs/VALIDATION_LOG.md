@@ -62,7 +62,7 @@ amortizes over larger ones.  GC=32 for S in (4096, 16384], GC=64 elsewhere.
 |---|---|
 | date | 2026-09-05 |
 | machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util (GPU0 medians below) |
-| tree state | commits `fab936d` (fuse P+plsum) + `819872a` (mma swizzle) + `ae0137b` (union_tok OOB fix) + `f816194` (dispatch gate) + `c886399` (PV hoist) + `41445f5` (QK hoist) + `6085bb7` (softmax token hoist) + `4d9f4d2` (gather16) + `18cb987` (drop prof) + `2407a34` (docs) |
+| tree state | commits `fab936d` + `819872a` + `ae0137b` + `f816194` + `c886399` + `41445f5` + `6085bb7` + `4d9f4d2` + `18cb987` + `9e2d0df` (rowmax-into-QK) + `7cc1eae` (rescale-into-P) + docs |
 | build command | `GDN_QSA_BUILD_OPS=qsa_pass2_tc bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
 | correctness | **37/37 PASS** (full suite) + reuse recent/random all-S PASS + dense-union S=8188/4092 PASS |
 
@@ -96,14 +96,7 @@ Release-bench row (same clean GPU0, `benchmarks/bench_qsa_core.py`, mean n=10):
 |---|---|---|---|---|---|---|
 | 512 | 1.39 | 0.36 | 0.36* | 3.88x | 1.00x | 3.89x |
 | 2048 | 16.38 | 3.85 | 2.09 | 4.25x | **1.85x** | 7.85x |
-| 8192 | 91.12 | 25.91 | 12.88 | 3.52x | **2.01x** | **7.07x** |
-
-`*` S=512 is within noise of v3 (reuse pays its union-build overhead only for
-long sequences), so the `qsa_pass2_tc_reuse` auto-dispatch is gated to
-`1024 ≤ S ≤ 8192` (commit `f816194`); below that it routes to v3.  relL1 vs
-scalar 1.6e-3 (unchanged), 37/37 tests PASS.  (Rejected during the session:
-pad-row-skip — consistently ~0.2ms slower; tmax-barrier merge — reading
-`pmax[8]` per thread costs ~3000x the barrier saving.)
+| 8192 | 91.12 | 25.91 | 11.50 | 3.52x | **2.26x** | **7.93x** |
 
 `*` S=512 is within noise of v3 (reuse pays its union-build overhead only for
 long sequences), so the `qsa_pass2_tc_reuse` auto-dispatch is gated to
@@ -118,6 +111,32 @@ pad-row-skip — consistently ~0.2ms slower; tmax-barrier merge — reading
   list `UMAX+N_TILE` and padded through the last tile boundary; verified with a
   synthetic dense-union case (S=8188/4092 reuse-vs-v3 relL1 ~1.1e-3, PASS).
 - `f816194` — dispatch gate 1024≤S≤8192; reuse wired into `bench_qsa_core.py`.
+
+**Post-release perf branch merged (2026-09-06): row-max into QK + rescale into P.**
+`9e2d0df` merges the row-max into QK — the mma leaves the scaled scores in
+registers, so pmax is computed right there (mask the thread's 2 score-columns,
+4-lane shuffle) instead of re-reading Sc in a separate phase (removes one
+barrier).  `7cc1eae` stores `mnew[r]=max(sm_m[r], tile-max)` in the tmax buffer
+so the rescale AND the P phase read one value (the rescale→P barrier vanishes),
+defers the sm_l/sm_m update to a single owner per row (reads its own pre-tile
+sm_m/sm_l, no barrier before PV), and skips the pad-row P stores.  7 → 5
+barriers per tile.  Combined: S=8192 12.88 → **11.50ms (2.26x v3, 7.93x
+scalar)**; 37/37 PASS.
+
+**Rejected on the perf branch (reverted — do not re-explore):**
+- v2 "pair-ordered" mma-fragment swizzle (LDS.64 for a[0]/a[2]): 14.92ms — the
+  ord16 layout collides on banks (gi*4 + {0,2,4,6} is 2-way) whereas the v1
+  swizzle's gi*4+li covers all 32 banks.
+- Q-only kPitchQ (144 then 272) + v2 swizzle: 11.71ms — 144 was an OOB bug
+  (the swizzled row needs 256 positions); with 272 the LDS.64 gain is offset
+  by the compiler/bank behaviour.  No net win.
+- `corr==1` skip of the O_r rescale FMULs: 11.78ms — in recent mode each tile
+  brings new tokens so the running max keeps growing; corr is rarely exactly 1
+  and the branch/divergence costs more than the saved FMULs.
+  Structural floor reached: p_plsum 34% / qk 25% / gather 18% (LDS + barriers
+  + online-softmax bookkeeping).  A further speedup needs a structural rewrite
+  (halve smem for 2 CTA/SM — the union/qmap buffers are a 25KB hard floor; or a
+  kv-major tile-stationary kernel).
 
 ---
 

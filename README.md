@@ -21,8 +21,8 @@ kernels and reproducible benchmarks against public baselines.
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
 >
-> **v0.2.1**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
-> S=8192 is 12.88ms (2.01x over the TC pass2, 7.07x over scalar).
+> **v0.2.2**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
+> S=8192 is 11.50ms (2.26x over the TC pass2, 7.93x over scalar).
 
 ## News
 
@@ -161,8 +161,8 @@ out = qsa_sparse_core_attention(q, k, v, block_idx, r)
 sel_idx, sel_cnt = qsa_expand(block_idx, r)
 out_tc = qsa_pass2_tc(q, k, v, sel_idx, sel_cnt, r)
 
-# query-tile local K/V reuse pass2 — ~2x faster than qsa_pass2_tc at
-# S=8192 (12.88ms vs 25.91ms): shares each gathered 64-token tile across 4
+# query-tile local K/V reuse pass2 — ~2.26x faster than qsa_pass2_tc at
+# S=8192 (11.50ms vs 25.91ms): shares each gathered 64-token tile across 4
 # adjacent queries, hoists loop-invariant fragment/token loads, and swizzles
 # Q/K/P smem so each mma A/B fragment register loads with a single LDS.32;
 # auto-falls back to v3 for S>8192.
@@ -266,11 +266,11 @@ adds query-tile local K/V reuse (auto-dispatched for `1024 ≤ S ≤ 8192`).
 |---|---|---|---|---|---|
 | 512 | 1.39 | 0.36 | 0.36 | 3.88x | 1.00x |
 | 2048 | 16.38 | 3.85 | 2.09 | 4.25x | 1.85x |
-| 8192 | 91.12 | 25.91 | 12.88 | 3.52x | **2.01x** |
+| 8192 | 91.12 | 25.91 | 11.50 | 3.52x | **2.26x** |
 
 Reuse is within noise of v3 at S=512 (its union-build overhead doesn't pay at
 short sequences), so the auto-dispatch falls back to v3 below S=1024.
-The S=8192 reuse path is 7.07x over scalar.
+The S=8192 reuse path is 7.93x over scalar.
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
 
@@ -288,7 +288,7 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
   groups four adjacent queries per CTA, builds the union of their selected token
   sets in smem, and shares each gathered 64-token K/V tile — S=8192 **12.9ms
-  (2.01x over the per-query v3 path, 7.07x over scalar)**, S=2048 2.09ms (1.85x
+  (2.26x over the per-query v3 path, 7.93x over scalar)**, S=2048 2.09ms (1.85x
   over v3). On top of the union-sharing it (a) fuses the softmax P/plsum into
   one barrier, (b) swizzles the Q/K/P smem layouts so each mma A/B fragment
   register (columns j and j+8) is one LDS.32 instead of two scattered LDS.32,
