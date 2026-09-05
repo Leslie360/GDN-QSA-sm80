@@ -75,18 +75,11 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     const int*    __restrict__ sel_idx,
     const int*    __restrict__ sel_cnt,
     __nv_bfloat16* __restrict__ out,
-    int B, int S, int H, int KVH, int NMAX, float scale, int UMAX,
-    unsigned long long* __restrict__ prof) {
+    int B, int S, int H, int KVH, int NMAX, float scale, int UMAX) {
     const int HBLK = H / KVH;   // 12 real query rows per head-group
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    unsigned long long c_setup = 0, c_gather = 0, c_qk = 0, c_rowmax = 0,
-                       c_rescale = 0, c_ppl = 0, c_pv = 0, c_fin = 0;
-    unsigned long long t0 = 0;
-#define PROF_BEGIN()  do { t0 = clock64(); } while (0)
-#define PROF_ACC(acc) do { acc += (clock64() - t0); } while (0)
-    PROF_BEGIN();
     const int gi   = lane / 4;
     const int li   = lane % 4;
 
@@ -194,9 +187,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             for (int d = 0; d < 8; d++) O_r[qq][rh][d] = 0.f;
     __syncthreads();
     const int n_utiles = (U + N_TILE - 1) / N_TILE;
-    PROF_ACC(c_setup);
     for (int t = 0; t < n_utiles; t++) {
-        PROF_BEGIN();
         const int tbase = t * N_TILE;
 
         // ---- 1) vectorized gather K/V: union_tok[t*64 + row] -> Ksm/Vsm ----
@@ -238,8 +229,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
-        PROF_ACC(c_gather);
-        PROF_BEGIN();
 
         // ---- 2) QK: all queries share one barrier ----
         // The Ksm B operand is identical across the 4 qq iterations — hoist it
@@ -280,8 +269,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
-        PROF_ACC(c_qk);
-        PROF_BEGIN();
 
         // ---- 3) row-max + tmax: all queries, shared barriers ----
         // union_tok/qmap are qq-invariant (only the `1<<qq` bit test differs) —
@@ -319,8 +306,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
-        PROF_ACC(c_rowmax);
-        PROF_BEGIN();
 
         // ---- 4) online rescale: all queries, registers ----
         for (int qq = 0; qq < M_TILE; qq++) {
@@ -338,8 +323,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             for (int d = 0; d < 8; d++) O_r[qq][1][d] *= corr;
         }
         __syncthreads();
-        PROF_ACC(c_rescale);
-        PROF_BEGIN();
 
         // ---- 5) fused P + plsum + sm_l: ONE barrier (P smem round-trip for
         //      plsum eliminated — the 8-lane shuffle reduce runs on the p value
@@ -385,8 +368,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                 }
             }
         __syncthreads();
-        PROF_ACC(c_ppl);
-        PROF_BEGIN();
 
         // ---- 6) TC PV: all queries, one barrier ----
         // Fragment operands are loop-invariant in a way the compiler cannot
@@ -434,9 +415,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
-        PROF_ACC(c_pv);
     }
-    PROF_BEGIN();
 
     // ---- finalize: thread (gi,li) owns rows gi/gi+8 of each query ----
     for (int qq = 0; qq < M_TILE; qq++) {
@@ -456,20 +435,13 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
     }
-    PROF_ACC(c_fin);
-    if (prof) {
-        unsigned long long loc[8] = {c_setup, c_gather, c_qk, c_rowmax,
-                                     c_rescale, c_ppl, c_pv, c_fin};
-#pragma unroll
-        for (int i = 0; i < 8; i++) atomicAdd(&prof[i], loc[i]);
-    }
 }
 
 void launch_qsa_pass2_tc_reuse(const __nv_bfloat16* q, const __nv_bfloat16* k,
                                const __nv_bfloat16* v, const int* sel_idx,
                                const int* sel_cnt, __nv_bfloat16* out,
                                int B, int S, int H, int KVH, int NMAX,
-                               cudaStream_t stream, unsigned long long* prof = nullptr) {
+                               cudaStream_t stream) {
     const float scale = 1.0f / sqrtf((float)D);
     const int UMAX = U_MAX_CAP < S ? U_MAX_CAP : S;   // union token budget
     size_t smem_bytes = (size_t)((M_TILE * M16 + 2 * N_TILE) * kPitch * sizeof(__nv_bfloat16)
@@ -486,7 +458,7 @@ void launch_qsa_pass2_tc_reuse(const __nv_bfloat16* q, const __nv_bfloat16* k,
     auto kern = qsa_pass2_tc_reuse_kernel;
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
     kern<<<nblocks, 256, smem_bytes, stream>>>(
-        q, k, v, sel_idx, sel_cnt, out, B, S, H, KVH, NMAX, scale, UMAX, prof);
+        q, k, v, sel_idx, sel_cnt, out, B, S, H, KVH, NMAX, scale, UMAX);
 }
 
 }  // namespace qsa_pass2_tc_reuse
