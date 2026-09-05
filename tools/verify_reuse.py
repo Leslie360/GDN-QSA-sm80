@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Correctness + quick perf check for qsa_pass2_tc_reuse vs scalar/v3.
 
-Reproduce (cloud): cd <repo> && PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
-    <env>/bin/python tools/verify_reuse.py
+Reproduce: cd <repo> && PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
+    <python> tools/verify_reuse.py
 """
 
 import time

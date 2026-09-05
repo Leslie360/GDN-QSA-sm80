@@ -73,6 +73,7 @@ gdn_qsa_sm80/        Python package: per-op functional API + torch references
 tests/               pytest, one file per operator (37 tests)
 benchmarks/          per-op benchmark scripts (bench_<op>.py)
 docs/                per-op notes, methodology, correctness policy, validation log
+tools/               analysis / verification helpers (reuse analysis, proto checks)
 third_party/         vendored CUTLASS/CuTe headers (BSD-3-Clause)
 scripts/             build.sh / verify_all.sh / bench_all.sh
 ```
