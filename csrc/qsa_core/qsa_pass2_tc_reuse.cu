@@ -219,26 +219,33 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         __syncthreads();
 
         // ---- 2) QK: all queries share one barrier ----
-        for (int qq = 0; qq < M_TILE; qq++) {
-            if (warp < 8) {
+        // The Ksm B operand is identical across the 4 qq iterations — hoist it
+        // (like the PV hoist): QK LDS 384 -> 288 per thread/tile.
+        if (warp < 8) {
+            const int colw = warp * 8;
+            uint32_t Kf[D / K16][2];
+#pragma unroll
+            for (int kb = 0; kb < D / K16; kb++) {
+                const int ko = kb * K16;
+                // d-swizzled smem: the mma A/B register pair (col j, j+8) lives
+                // at (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
+                Kf[kb][0] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li]);
+                Kf[kb][1] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li + 8]);
+            }
+            for (int qq = 0; qq < M_TILE; qq++) {
                 float s0v[4] = {0.f, 0.f, 0.f, 0.f};
                 float s1v[4] = {0.f, 0.f, 0.f, 0.f};
-                const int colw = warp * 8;
                 const __nv_bfloat16* Qq = Qsm + qq * M16 * kPitch;
                 float* Scq = Sc + qq * M16 * nPitch;
 #pragma unroll
                 for (int kb = 0; kb < D / K16; kb++) {
                     const int ko = kb * K16;
-                    // d-swizzled smem: the mma A/B register pair (col j, j+8)
-                    // lives at (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
                     uint32_t a[4];
                     a[0] = ld32(&Qq[gi * kPitch + ko + 2 * li]);
                     a[1] = ld32(&Qq[(gi + 8) * kPitch + ko + 2 * li]);
                     a[2] = ld32(&Qq[gi * kPitch + ko + 2 * li + 8]);
                     a[3] = ld32(&Qq[(gi + 8) * kPitch + ko + 2 * li + 8]);
-                    uint32_t bb[2];
-                    bb[0] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li]);
-                    bb[1] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li + 8]);
+                    uint32_t bb[2] = {Kf[kb][0], Kf[kb][1]};
                     if (kb & 1) mma16n8k16(s1v, a, bb); else mma16n8k16(s0v, a, bb);
                 }
                 s0v[0] += s1v[0]; s0v[1] += s1v[1]; s0v[2] += s1v[2]; s0v[3] += s1v[3];
