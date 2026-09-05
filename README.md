@@ -20,6 +20,9 @@ kernels and reproducible benchmarks against public baselines.
 > **Status**: all four operators shipped — `gdn_chunk` (M1), `qsa_indexer` + `output_gate` (M2), `qsa_core` (M3).
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
+>
+> **v0.1.0**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
+> S=8192 is 12.88ms (2.01x over the TC pass2, 7.07x over scalar).
 
 ## News
 
