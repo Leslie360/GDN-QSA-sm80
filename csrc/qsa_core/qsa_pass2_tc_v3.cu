@@ -89,6 +89,12 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
     float*  plsum = part + M16 * 8;
     float*  tmax = part + M16 * 16;
     float*  tlsum = tmax + M16;
+    // Shared running per-row softmax max/sum.  Every row's max/sum is the same
+    // for all threads, so one shared copy is correct and lets each lane update
+    // only its OWN rows (gi, gi+8) instead of redundantly recomputing all 16
+    // (32x waste) with the old per-thread local arrays.
+    float*  sm_m = tlsum + M16;
+    float*  sm_l = sm_m + M16;
 
     // ---- cooperative load Q: 12 real rows + 4 zero pad rows ----
     for (int e = tid; e < M16 * D; e += 256) {
@@ -102,10 +108,8 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
     }
     __syncthreads();
 
-    float m_r[M16];
-    float l_r[M16];
 #pragma unroll
-    for (int r = 0; r < M16; r++) { m_r[r] = -1e30f; l_r[r] = 0.f; }
+    for (int r = 0; r < M16; r++) { sm_m[r] = -1e30f; sm_l[r] = 0.f; }
     float O_r[2][8];
 #pragma unroll
     for (int rh = 0; rh < 2; rh++)
@@ -166,16 +170,19 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
         __syncthreads();
 
         // ---- 3) tile row-max over valid cols (all warps read Sc), butterfly ----
-        // All 8 warps participate to keep them busy; each covers all rows over
-        // its own 8-col slice (cols warp*8..warp*8+8 for warps 0-3; warps 4-7
-        // read the same Sc but only cols beyond 32 are invalid -> contribute 0).
-        for (int r = 0; r < M16; r++) {
-            float pm = -1e30f;
-            for (int c = 0; c < 8; c++) {
-                int m = warp * 8 + c;
-                if (m < N_TILE && valid[m]) pm = fmaxf(pm, Sc[r * nPitch + m]);
-            }
-            pmax[r * 8 + warp] = pm;
+        // Distributed: lane l owns 4 (r, m) cells (same mapping as the P pass),
+        // one 8-lane shuffle reduction collapses each row's 8 columns, and lane
+        // c==0 of each row-group writes pmax.  The old version made every lane
+        // redundantly re-iterate all 16x8 cells (32x waste).
+#pragma unroll
+        for (int it = 0; it < 4; it++) {
+            int e = it * 32 + lane;
+            int r = e / 8; int c = e % 8; int m = warp * 8 + c;
+            float val = (m < N_TILE && valid[m]) ? Sc[r * nPitch + m] : -1e30f;
+            val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 1));
+            val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 2));
+            val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 4));
+            if (c == 0) pmax[r * 8 + warp] = val;   // rows it*4+0..3, lane c==0
         }
         __syncthreads();
         for (int r = tid / 16; r < M16; r += 16) {
@@ -185,22 +192,22 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
         }
         __syncthreads();
 
-        // ---- 4) online rescale O/l by corr, fold new max (register-only, no sync) ----
+        // ---- 4) online rescale O/l by corr, fold new max ----
+        // Each lane only touches its OWN rows (gi, gi+8) in the shared running
+        // max/sum; the 4 lanes sharing a row write the identical value, then a
+        // barrier makes every row's m/l visible to the P pass below.
         {
-            float c0 = 0.f, c1 = 0.f;
+            float mnew = fmaxf(sm_m[gi], tmax[gi]);
+            float corr = __expf(sm_m[gi] - mnew);
+            sm_m[gi] = mnew; sm_l[gi] *= corr;
 #pragma unroll
-            for (int r = 0; r < M16; r++) {
-                float mnew = fmaxf(m_r[r], tmax[r]);
-                float corr = __expf(m_r[r] - mnew);
-                m_r[r] = mnew;
-                l_r[r] *= corr;
-                if (r == gi) c0 = corr;
-                if (r == gi + 8) c1 = corr;
-            }
+            for (int d = 0; d < 8; d++) O_r[0][d] *= corr;
+            mnew = fmaxf(sm_m[gi + 8], tmax[gi + 8]);
+            corr = __expf(sm_m[gi + 8] - mnew);
+            sm_m[gi + 8] = mnew; sm_l[gi + 8] *= corr;
 #pragma unroll
-            for (int d = 0; d < 8; d++) O_r[0][d] *= c0;
-#pragma unroll
-            for (int d = 0; d < 8; d++) O_r[1][d] *= c1;
+            for (int d = 0; d < 8; d++) O_r[1][d] *= corr;
+            __syncthreads();
         }
 
         // ---- 5) P = exp(S - mnew) quantized to bf16; partial tile-sumexp ----
@@ -211,7 +218,7 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
         for (int it = 0; it < 4; it++) {
             int e = it * 32 + lane;
             int r = e / 8; int c = e % 8; int m = warp * 8 + c;
-            float p = (m < N_TILE && valid[m]) ? __expf(Sc[r * nPitch + m] - m_r[r]) : 0.f;
+            float p = (m < N_TILE && valid[m]) ? __expf(Sc[r * nPitch + m] - sm_m[r]) : 0.f;
             // BUGFIX: warp 4-7 has m in [32,64) which is OOB for P[16][N_TILE=32].
             // Without the guard, P[r*32 + m] writes into row r+1 / the part buffers
             // (pmax/plsum), corrupting the softmax reduction for ALL GQA shapes.
@@ -229,11 +236,13 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
             if (c == 0) plsum[r * 8 + warp] = pv;
         }
         __syncthreads();
+        // each lane folds only its own rows' partial sums into sm_l
 #pragma unroll
-        for (int r = 0; r < M16; r++) {
+        for (int rh = 0; rh < 2; rh++) {
+            int r = gi + rh * 8;
             float lt = 0.f;
             for (int x = 0; x < 8; x++) lt += plsum[r * 8 + x];
-            l_r[r] += lt;
+            sm_l[r] += lt;
         }
         __syncthreads();
 
@@ -267,7 +276,7 @@ __global__ void __launch_bounds__(256, 2) qsa_pass2_tc_v3_kernel(
     for (int rh = 0; rh < 2; rh++) {
         const int r = gi + rh * 8;
         if (r < HBLK) {
-            float inv = 1.f / fmaxf(l_r[r], 1e-30f);
+            float inv = 1.f / fmaxf(sm_l[r], 1e-30f);
             int h = gg * HBLK + r;
             __nv_bfloat16* o = out + ((long long)bs * H + h) * D + warp * 32;
 #pragma unroll
