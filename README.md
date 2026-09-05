@@ -259,13 +259,13 @@ adds query-tile local K/V reuse (auto-dispatched for `1024 ≤ S ≤ 8192`).
 
 | S | scalar (ms) | TC pass2 v3 (ms) | TC pass2 reuse (ms) | v3 vs scalar | reuse vs v3 |
 |---|---|---|---|---|---|
-| 512 | 1.39 | 0.36 | 0.40 | 3.89x | 0.89x |
-| 2048 | 15.58 | 3.86 | 3.34 | 4.03x | 1.16x |
-| 8192 | 91.19 | 25.94 | 20.85 | 3.52x | **1.24x** |
+| 512 | 1.39 | 0.36 | 0.36 | 3.88x | 1.00x |
+| 2048 | 16.38 | 3.85 | 2.09 | 4.25x | 1.85x |
+| 8192 | 91.12 | 25.91 | 12.88 | 3.52x | **2.01x** |
 
 Reuse is within noise of v3 at S=512 (its union-build overhead doesn't pay at
 short sequences), so the auto-dispatch falls back to v3 below S=1024.
-The S=8192 reuse path is 4.37x over scalar.
+The S=8192 reuse path is 7.07x over scalar.
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_core.py`
 
@@ -282,13 +282,16 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 - `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.94ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
   groups four adjacent queries per CTA, builds the union of their selected token
-  sets in smem, and shares each gathered 64-token K/V tile — S=8192 20.85ms
-  (1.24x over the per-query v3 path, vs scalar 4.37x). On top of the
-  union-sharing it (a) fuses the softmax P/plsum into one barrier and (b)
-  swizzles the Q/K/P smem layouts so each mma A/B fragment register (columns j
-  and j+8) is one LDS.32 instead of two scattered LDS.32. Block-reuse analysis
-  (`tools/analyze_qsa_core_reuse.py`) showed ~90% of the gather L2 traffic is
-  shared across adjacent queries.
+  sets in smem, and shares each gathered 64-token K/V tile — S=8192 **12.9ms
+  (2.01x over the per-query v3 path, 7.07x over scalar)**, S=2048 2.09ms (1.85x
+  over v3). On top of the union-sharing it (a) fuses the softmax P/plsum into
+  one barrier, (b) swizzles the Q/K/P smem layouts so each mma A/B fragment
+  register (columns j and j+8) is one LDS.32 instead of two scattered LDS.32,
+  (c) hoists the PV/QK fragment loads and the softmax token/ownership reads out
+  of the per-query loops (the mma B operands and union_tok/qmap are
+  qq-invariant), and (d) gathers 16 cols/thread so swz pairs store as uint32.
+  Block-reuse analysis (`tools/analyze_qsa_core_reuse.py`) showed ~90% of the
+  gather L2 traffic is shared across adjacent queries.
 - `fused_linear_ce` and `flashmla-sm80` intentionally live outside this repo
   (see Scope).
 

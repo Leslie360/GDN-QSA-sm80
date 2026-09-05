@@ -36,7 +36,8 @@ adjacent queries). On top of the union-sharing it
 (b) swizzles the Q/K/P smem layouts (`swz16(j)=(j&7)*2+(j>>3)`) so each mma
 A/B fragment register (columns j and j+8) loads with one LDS.32 instead of two
 scattered LDS.32. `nPitch=72` gives the PV A-fragment a full 32-bank spread.
-S=8192 **20.85ms (4.37x over scalar, 1.24x over v3)**, S=2048 3.34ms (4.67x).
+S=8192 **12.88ms (7.07x over scalar, 2.01x over v3)**, S=2048 2.09ms (7.85x
+over scalar, 1.85x over v3).
 Dispatched only when `1024 ≤ S ≤ 8192` and `S % 4 == 0`; below S=1024 the
 union-build overhead does not pay off (S=512 is within noise of v3), so it
 falls back to v3.
