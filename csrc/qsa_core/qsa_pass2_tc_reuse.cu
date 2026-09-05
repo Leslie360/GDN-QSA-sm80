@@ -290,39 +290,22 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         }
         __syncthreads();
 
-        // ---- 3) tmax: reduce the 8 warps' pmax (row-max was computed in QK) ----
+        // ---- 3) running max: mnew[r] = max(sm_m[r], tile row max).  One thread
+        //      per row (16 threads).  Storing mnew (not the raw max) lets BOTH the
+        //      rescale and the P phase read a single value, so phases 4+5 fuse.
         if ((tid & 15) == 0) {                       // one thread per row
             const int r = tid >> 4;
             for (int qq = 0; qq < M_TILE; qq++) {
                 float mm = -1e30f;
                 for (int x = 0; x < 8; x++) mm = fmaxf(mm, pmax[qq * (M16 * 8) + r * 8 + x]);
-                tmax[qq * M16 + r] = mm;
+                tmax[qq * M16 + r] = fmaxf(sm_m[qq * M16 + r], mm);   // now holds mnew
             }
         }
         __syncthreads();
 
-        // ---- 4) online rescale: all queries, registers ----
-        for (int qq = 0; qq < M_TILE; qq++) {
-            const int r0 = gi, r1 = gi + 8;
-            const int rep0 = (r0 & 7) * 4, rep1 = (r1 & 7) * 4;   // warp-0 lane (r%8)*4 owns row r
-            float mnew = fmaxf(sm_m[qq * M16 + r0], tmax[qq * M16 + r0]);
-            float corr = __expf(sm_m[qq * M16 + r0] - mnew);
-            if (tid == rep0) { sm_m[qq * M16 + r0] = mnew; sm_l[qq * M16 + r0] *= corr; }
-#pragma unroll
-            for (int d = 0; d < 8; d++) O_r[qq][0][d] *= corr;
-            mnew = fmaxf(sm_m[qq * M16 + r1], tmax[qq * M16 + r1]);
-            corr = __expf(sm_m[qq * M16 + r1] - mnew);
-            if (tid == rep1) { sm_m[qq * M16 + r1] = mnew; sm_l[qq * M16 + r1] *= corr; }
-#pragma unroll
-            for (int d = 0; d < 8; d++) O_r[qq][1][d] *= corr;
-        }
-        __syncthreads();
-
-        // ---- 5) fused P + plsum + sm_l: ONE barrier (P smem round-trip for
-        //      plsum eliminated — the 8-lane shuffle reduce runs on the p value
-        //      still in registers; PV reads P (needs the barrier), but neither
-        //      PV nor anything else reads sm_l/plsum, so sm_l update is fused in
-        //      with no extra barrier). ----
+        // ---- 4) fused online-rescale + P + plsum (ONE barrier).  sm_m is stable
+        //      (only phase 5 updates it); rescale scales O_r with corr, P reads
+        //      mnew (tmax buffer).  Pad rows skip the P store (finalize discards).
         int ptok[4]; unsigned char pqm[4];
 #pragma unroll
         for (int it = 0; it < 4; it++) {
@@ -332,6 +315,15 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             pqm[it] = (ptok[it] >= 0) ? qmap[ptok[it]] : 0;
         }
         for (int qq = 0; qq < M_TILE; qq++) {
+            // rescale O_r (sm_m still pre-tile)
+            const int r0 = gi, r1 = gi + 8;
+            float corr0 = __expf(sm_m[qq * M16 + r0] - tmax[qq * M16 + r0]);
+#pragma unroll
+            for (int d = 0; d < 8; d++) O_r[qq][0][d] *= corr0;
+            float corr1 = __expf(sm_m[qq * M16 + r1] - tmax[qq * M16 + r1]);
+#pragma unroll
+            for (int d = 0; d < 8; d++) O_r[qq][1][d] *= corr1;
+            // P + plsum
             const int s_qq = s0 + qq;
             const float* Scq = Sc + qq * M16 * nPitch;
             __nv_bfloat16* Pq = P + qq * M16 * nPitch;
@@ -340,9 +332,9 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                 int e = it * 32 + lane;
                 int r = e / 8; int c = e % 8; int m = warp * 8 + c;
                 bool ok = (m < N_TILE) && (ptok[it] >= 0) && (ptok[it] <= s_qq) && (pqm[it] & (1u << qq));
-                float p = ok ? __expf(Scq[r * nPitch + m] - sm_m[qq * M16 + r]) : 0.f;
+                float p = ok ? __expf(Scq[r * nPitch + m] - tmax[qq * M16 + r]) : 0.f;
                 float pb = b2f(f2b(p));   // match PV's bf16 operands exactly
-                if (m < N_TILE) Pq[r * nPitch + swz_d(m)] = f2b(p);
+                if (r < HBLK && m < N_TILE) Pq[r * nPitch + swz_d(m)] = f2b(p);  // skip pad rows
                 float pv = pb;
                 pv += __shfl_xor_sync(0xffffffffu, pv, 1);
                 pv += __shfl_xor_sync(0xffffffffu, pv, 2);
@@ -351,17 +343,24 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
+
+        // ---- 5) sm_l + sm_m update (single owner per row).  The owner reads its
+        //      OWN sm_m/sm_l (still pre-tile — not yet written this qq) so no
+        //      barrier is needed before PV (PV reads P, already visible via the
+        //      barrier above; sm_m/sm_l are next read at phase 3 / finalize).
         for (int qq = 0; qq < M_TILE; qq++)
 #pragma unroll
             for (int rh = 0; rh < 2; rh++) {
-                int r = gi + rh * 8;
+                const int r = gi + rh * 8;
                 if (tid == (r & 7) * 4) {
+                    const float mnew = tmax[qq * M16 + r];
+                    const float corr = __expf(sm_m[qq * M16 + r] - mnew);
                     float lt = 0.f;
                     for (int x = 0; x < 8; x++) lt += plsum[qq * (M16 * 8) + r * 8 + x];
-                    sm_l[qq * M16 + r] += lt;
+                    sm_l[qq * M16 + r] = sm_l[qq * M16 + r] * corr + lt;
+                    sm_m[qq * M16 + r] = mnew;
                 }
             }
-        __syncthreads();
 
         // ---- 6) TC PV: all queries, one barrier ----
         // Fragment operands are loop-invariant in a way the compiler cannot
