@@ -3,6 +3,59 @@
 Clean A800 (SM80) build / test / benchmark record for gdn-qsa-sm80. Every README
 benchmark table row traces to a run below.
 
+## Run 4 (2026-09-05) — qsa_core pass2 + gdn_chunk dispatch
+
+| Field | Value |
+|---|---|
+| date | 2026-09-05 |
+| machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util (numbers below are GPU0 medians) |
+| tree state | commits `e9c7eda`+`6dc3460` (qsa_core pass2) + `1d2875a`+`90d2fe6`+`c4fe1cc` (gdn_chunk GC dispatch) |
+| build command | `GDN_QSA_BUILD_OPS=... bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
+| correctness | **37/37 PASS** |
+
+### qsa_core pass2 — 62.4 → 25.4 ms at S=8192
+
+`clock64()` section instrumentation showed the online softmax was 73% of pass2
+time, from two 32x cross-lane redundancies: the tile row-max loop made every
+lane re-iterate all 16×8 cells, and the online rescale recomputed exp for all
+16 rows per lane.  Fixed by distributing the cells across lanes (8-lane shuffle
+reduction) and moving the running max/sum to one shared copy with per-lane
+updates of only its own rows (gi, gi+8).  TC pass2 vs scalar:
+
+| S | scalar (ms) | TC-pass2 (ms) | speedup |
+|---|---|---|---|
+| 512 | 1.39 | 0.37 | 3.79x |
+| 2048 | 17.28 | 3.86 | 4.47x |
+| 8192 | 91.36 | 25.38 | 3.60x |
+
+Also tried and rejected: dual mma accumulators (neutral), N_TILE=32 for 2
+CTAs/SM (27.1 ms — tile count doubles and only 4 warps do QK).
+
+### gdn_chunk — dynamic GC dispatch
+
+The superchunk group size is swept per S (A800, g=-rand*2.0): the serial
+per-group replay chain shortens with smaller groups while the cross-group scan
+amortizes over larger ones.  GC=32 for S in (4096, 16384], GC=64 elsewhere.
+
+| S | ours (ms) | fla (ms) | speedup |
+|---|---|---|---|
+| 2048 | 0.464 | 0.675 | 1.45x |
+| 4096 | 0.566 | 0.676 | 1.19x |
+| 8192 | 0.895 | 1.197 | 1.34x |
+| 32768 | 2.910 | 4.702 | 1.62x |
+
+### Next steps (documented, not yet implemented)
+
+- The pass2/replay kernels are at ~50% bf16 TC utilization (serial chunk chain);
+  a software-pipelined rewrite (8-warp mma, register-persistent state) is the
+  remaining big lever for qsa_core pass2 and gdn_chunk replay.
+- gdn_chunk workspace fusion: the prepare+replay workspace round-trip (240MB
+  write + read at S=8192) costs ~0.16ms; fusing prepare into the replay (with a
+  stage1_reset that no longer depends on the workspace) would cut total memory
+  traffic roughly in half.  A/B-verified the loads cost ~0.16ms.
+
+---
+
 ## Run 2 (2026-09-04) — qsa_indexer long-sequence optimization
 
 | Field | Value |
