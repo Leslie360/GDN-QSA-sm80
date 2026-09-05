@@ -969,9 +969,10 @@ std::vector<torch::Tensor> forward_gdn_chunk_auto(
         return forward_gdn_chunk(qq, kk, v, g, beta, output_final_state);
     }
     // Long sequence: reset fast path, exact fallback inside.  GC is swept per S
-    // (A800, g=-rand*2.0): S<=16384 -> GC=32 best, S>16384 -> GC=64 best
-    // (S=4096: 64=0.67<32=0.69; S=8192: 32=1.05<64=1.21; S=32768: 64=3.07<32=3.61).
-    const int64_t GC = (S <= 16384) ? 32 : 64;
+    // (A800, g=-rand*2.0): S=8192..16384 -> GC=32 best (shorter per-group replay
+    // chain), S<=4096 and S>16384 -> GC=64 (S=4096: 64=0.67<32=0.69;
+    // S=8192: 32=1.05<64=1.21; S=32768: 64=3.07<32=3.61).
+    const int64_t GC = (S > 4096 && S <= 16384) ? 32 : 64;
     auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, GC, 1e-6, 1.0, 1e-2);
     if (!output_final_state) {
         r[1] = torch::Tensor();
