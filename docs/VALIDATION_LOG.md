@@ -56,6 +56,64 @@ amortizes over larger ones.  GC=32 for S in (4096, 16384], GC=64 elsewhere.
 
 ---
 
+## Run 5 (2026-09-05) — qsa_core query-tile reuse: P/plsum fusion + mma-fragment swizzle
+
+| Field | Value |
+|---|---|
+| date | 2026-09-05 |
+| machine / GPU | clean **NVIDIA A800-SXM4-80GB** (SM80); a neighbour on GPU1 was at 100% util (GPU0 medians below) |
+| tree state | commits `fab936d` (fuse P+plsum) + `819872a` (mma swizzle) + `ae0137b` (union_tok OOB fix) + `f816194` (dispatch gate) + `2407a34` (docs) |
+| build command | `GDN_QSA_BUILD_OPS=qsa_pass2_tc bash scripts/build.sh` (torch 2.6.0+cu124, nvcc 12.4) |
+| correctness | **37/37 PASS** (full suite) + reuse recent/random all-S PASS + dense-union S=8188/4092 PASS |
+
+### qsa_core `qsa_pass2_tc_reuse` — query-tile local K/V reuse
+
+`clock64()` segment instrumentation of the reuse kernel (S=8192 recent):
+setup 3.4% / gather 9.3% / qk 21.3% / rowmax 12.4% / rescale 8.3% /
+p_plsum 20.9% / pv 23.7% / finalize 0.8%.  Two changes closed most of the
+non-gather overhead:
+
+1. **P+plsum fused into one barrier.**  The P phase wrote bf16 p to smem and
+   the plsum phase read it back across a barrier; the 8-lane shuffle reduce now
+   runs on the register value (quantized `b2f(f2b(p))` to match PV's bf16
+   operands exactly — relL1 unchanged at 1.6e-3).  `sm_l` is only read at
+   finalize, so its update no longer needs its own barrier.
+2. **mma-fragment smem swizzle.**  Each 32-bit mma A/B fragment register packs
+   two bf16 (columns j and j+8) that were 8 columns apart in row-major smem →
+   2x scattered LDS.32 at half byte-efficiency.  Swizzling each 16-element
+   K-group as `swz16(j)=(j&7)*2+(j>>3)` puts (j, j+8) adjacent at (2j, 2j+1),
+   so one LDS.32 loads the whole register.  Applied to Qsm/Ksm (d dimension,
+   Q-stage + gather-K store split into 8 uint16 at swz positions) and P (token
+   dimension).  Vsm is unchanged — its mma B pairs span two token rows and a
+   transpose would blow the smem budget.  `nPitch` 68→72 (36 words/row) gives
+   the PV A-fragment a full 32-bank spread; the redundant `[UMAX]` qmask copy
+   was dropped (read `qmap[token]` live, `tok>=0` guarded) to stay under the
+   166912B smem limit.
+
+Release-bench row (same clean GPU0, `benchmarks/bench_qsa_core.py`, mean n=10):
+
+| S | scalar (ms) | v3 `qsa_pass2_tc` (ms) | reuse `qsa_pass2_tc_reuse` (ms) | v3 vs scalar | reuse vs v3 | reuse vs scalar |
+|---|---|---|---|---|---|---|
+| 512 | 1.39 | 0.36 | 0.40* | 3.89x | 0.89x | 3.47x |
+| 2048 | 15.58 | 3.86 | 3.34 | 4.03x | 1.16x | 4.67x |
+| 8192 | 91.19 | 25.94 | 20.85 | 3.52x | **1.24x** | 4.37x |
+
+`*` S=512 is within noise of v3 (reuse pays its union-build overhead only for
+long sequences), so the `qsa_pass2_tc_reuse` auto-dispatch is gated to
+`1024 ≤ S ≤ 8192` (commit `f816194`); below that it routes to v3.  relL1 vs
+scalar 1.6e-3 (unchanged), 37/37 tests PASS.  (Rejected during the session:
+pad-row-skip — consistently ~0.2ms slower; tmax-barrier merge — reading
+`pmax[8]` per thread costs ~3000x the barrier saving.)
+
+**Fixes landed after the initial Run 5 (adversarial release review):**
+- `ae0137b` — union_tok out-of-bounds read on the last streaming tile when
+  `S % 64 != 0` and the union is near-dense (e.g. S=8188).  Sized the union
+  list `UMAX+N_TILE` and padded through the last tile boundary; verified with a
+  synthetic dense-union case (S=8188/4092 reuse-vs-v3 relL1 ~1.1e-3, PASS).
+- `f816194` — dispatch gate 1024≤S≤8192; reuse wired into `bench_qsa_core.py`.
+
+---
+
 ## Run 2 (2026-09-04) — qsa_indexer long-sequence optimization
 
 | Field | Value |
