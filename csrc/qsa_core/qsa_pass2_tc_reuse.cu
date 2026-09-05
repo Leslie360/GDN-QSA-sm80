@@ -46,12 +46,22 @@ __device__ __forceinline__ void mma16n8k16(float (&d)[4], uint32_t const (&a)[4]
 __device__ __forceinline__ uint4 ldg8(const __nv_bfloat16* __restrict__ src, int e8) {
     return *reinterpret_cast<const uint4*>(src + e8);
 }
+// mma-fragment swizzle: within each 16-element K-group store natural columns
+// j and j+8 (the two bf16 packed into one mma A/B register) CONTIGUOUSLY, so a
+// single LDS.32 loads the whole register pair.  swz16(0..7)=0,2,..14, 8..15=1,3,..15.
+__device__ __forceinline__ int swz16(int j) { return (j & 7) * 2 + (j >> 3); }
+__device__ __forceinline__ int swz_d(int d) { return (d & ~15) + swz16(d & 15); }   // D=256 d
+__device__ __forceinline__ uint32_t ld32(const __nv_bfloat16* p) {
+    return *reinterpret_cast<const uint32_t*>(p);
+}
 
 constexpr int M16 = 16;
 constexpr int D = 256;
 constexpr int N_TILE = 64;      // union token rows per streaming tile
 constexpr int kPitch = D + 8;   // 264 bf16/row: kill 8-way bank conflicts
-constexpr int nPitch = N_TILE + 4;  // 68
+constexpr int nPitch = N_TILE + 8;  // 72 bf16/row for P, 72 f32/row for Sc:
+// 36 words/row -> 36%32=4 gives the PV A-fragment ld32 a full 32-bank spread
+// (nPitch=68 -> 34%32=2 banks only 0..17, 2-way conflicts).
 constexpr int K16 = 16;
 constexpr int M_TILE = 4;       // adjacent queries per CTA (O in registers)
 constexpr int U_MAX_CAP = M_TILE * 2052;  // conservative union cap (MT*NMAX)
@@ -116,7 +126,8 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     sp += sizeof(int);
     short* union_tok = reinterpret_cast<short*>(sp);                      // [UMAX] int16
     sp += (size_t)UMAX * sizeof(short);
-    unsigned char* qmask = reinterpret_cast<unsigned char*>(sp);          // [UMAX]
+    // (query-ownership is read live from qmap[token]; no [UMAX] qmask copy —
+    //  saves 8KB smem, keeps us under the 166912B limit with nPitch=72.)
 
     // ---- stage Q: M_TILE queries x 16 rows (12 real + 4 pad) ----
     for (int e = tid; e < M_TILE * M16 * D; e += 256) {
@@ -128,7 +139,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             int h = gg * HBLK + rr;
             val = q[(((long long)b * S + s0 + qq) * H + h) * D + d];
         }
-        Qsm[qq * M16 * kPitch + rr * kPitch + d] = val;
+        Qsm[qq * M16 * kPitch + rr * kPitch + swz_d(d)] = val;
     }
     for (int e = tid; e < (S + 31) / 32; e += 256) bitmap[e] = 0;
     for (int e = tid; e < S; e += 256) qmap[e] = 0;
@@ -155,7 +166,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     for (int tok = tid; tok < S; tok += 256) {
         if (bitmap[tok >> 5] & (1u << (tok & 31))) {
             int pos = atomicAdd(u_cnt, 1);
-            if (pos < UMAX) { union_tok[pos] = (short)tok; qmask[pos] = qmap[tok]; }
+            if (pos < UMAX) union_tok[pos] = (short)tok;
         }
     }
     __syncthreads();
@@ -178,19 +189,29 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         const int tbase = t * N_TILE;
 
         // ---- 1) vectorized gather K/V: union_tok[t*64 + row] -> Ksm/Vsm ----
+        // Ksm is d-swizzled (swz_d) so QK's mma A/B fragments can LDS.32 whole
+        // register pairs; Vsm keeps the natural row-major layout (its mma B
+        // pairs span two token rows and cannot be made contiguous).
         for (int it = 0; it < (N_TILE * D / 8) / 256; it++) {
             int vidx = it * 256 + tid;
             int m  = vidx >> 5;        // union-token row within the tile
             int cb = vidx & 31;        // col-block (d = cb*8 .. cb*8+8)
             int tok = union_tok[tbase + m];
             int e8 = m * kPitch + cb * 8;
+            uint16_t* kp16 = reinterpret_cast<uint16_t*>(&Ksm[m * kPitch]);
             if (tok >= 0) {
                 long long off = ((long long)b * S + tok) * KVH * D + gg * D + cb * 8;
-                *reinterpret_cast<uint4*>(&Ksm[e8]) = ldg8(k, (int)off);
-                *reinterpret_cast<uint4*>(&Vsm[e8]) = ldg8(v, (int)off);
+                uint4 kv = ldg8(k, (int)off);
+                uint4 vv = ldg8(v, (int)off);
+                *reinterpret_cast<uint4*>(&Vsm[e8]) = vv;
+                uint16_t* kv16 = reinterpret_cast<uint16_t*>(&kv);
+                const int base = cb * 8;
+#pragma unroll
+                for (int j = 0; j < 8; j++) kp16[swz_d(base + j)] = kv16[j];
             } else {
-                *reinterpret_cast<uint4*>(&Ksm[e8]) = make_uint4(0, 0, 0, 0);
                 *reinterpret_cast<uint4*>(&Vsm[e8]) = make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int j = 0; j < 8; j++) kp16[swz_d(cb * 8 + j)] = 0;
             }
         }
         __syncthreads();
@@ -206,14 +227,16 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
 #pragma unroll
                 for (int kb = 0; kb < D / K16; kb++) {
                     const int ko = kb * K16;
+                    // d-swizzled smem: the mma A/B register pair (col j, j+8)
+                    // lives at (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
                     uint32_t a[4];
-                    a[0] = pack2(Qq[gi * kPitch + ko + li],         Qq[gi * kPitch + ko + li + 8]);
-                    a[1] = pack2(Qq[(gi + 8) * kPitch + ko + li],   Qq[(gi + 8) * kPitch + ko + li + 8]);
-                    a[2] = pack2(Qq[gi * kPitch + ko + li + 4],     Qq[gi * kPitch + ko + li + 12]);
-                    a[3] = pack2(Qq[(gi + 8) * kPitch + ko + li + 4], Qq[(gi + 8) * kPitch + ko + li + 12]);
+                    a[0] = ld32(&Qq[gi * kPitch + ko + 2 * li]);
+                    a[1] = ld32(&Qq[(gi + 8) * kPitch + ko + 2 * li]);
+                    a[2] = ld32(&Qq[gi * kPitch + ko + 2 * li + 8]);
+                    a[3] = ld32(&Qq[(gi + 8) * kPitch + ko + 2 * li + 8]);
                     uint32_t bb[2];
-                    bb[0] = pack2(Ksm[(colw + gi) * kPitch + ko + li],     Ksm[(colw + gi) * kPitch + ko + li + 8]);
-                    bb[1] = pack2(Ksm[(colw + gi) * kPitch + ko + li + 4], Ksm[(colw + gi) * kPitch + ko + li + 12]);
+                    bb[0] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li]);
+                    bb[1] = ld32(&Ksm[(colw + gi) * kPitch + ko + 2 * li + 8]);
                     if (kb & 1) mma16n8k16(s1v, a, bb); else mma16n8k16(s0v, a, bb);
                 }
                 s0v[0] += s1v[0]; s0v[1] += s1v[1]; s0v[2] += s1v[2]; s0v[3] += s1v[3];
@@ -235,7 +258,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                 int e = it * 32 + lane;
                 int r = e / 8; int c = e % 8; int m = warp * 8 + c;
                 int tok = union_tok[tbase + m];
-                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmask[tbase + m] & (1u << qq));
+                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmap[tok] & (1u << qq));
                 float val = ok ? Scq[r * nPitch + m] : -1e30f;
                 val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 1));
                 val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, 2));
@@ -285,10 +308,10 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                 int e = it * 32 + lane;
                 int r = e / 8; int c = e % 8; int m = warp * 8 + c;
                 int tok = union_tok[tbase + m];
-                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmask[tbase + m] & (1u << qq));
+                bool ok = (m < N_TILE) && (tok >= 0) && (tok <= s_qq) && (qmap[tok] & (1u << qq));
                 float p = ok ? __expf(Scq[r * nPitch + m] - sm_m[qq * M16 + r]) : 0.f;
                 float pb = b2f(f2b(p));   // match PV's bf16 operands exactly
-                if (m < N_TILE) Pq[r * nPitch + m] = f2b(p);
+                if (m < N_TILE) Pq[r * nPitch + swz_d(m)] = f2b(p);
                 float pv = pb;
                 pv += __shfl_xor_sync(0xffffffffu, pv, 1);
                 pv += __shfl_xor_sync(0xffffffffu, pv, 2);
@@ -319,10 +342,12 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
                     const int ko = kt * K16;
                     const int dg = warp * 32 + oc * 8 + gi;
                     uint32_t a[4];
-                    a[0] = pack2(Pq[gi * nPitch + ko + li],       Pq[gi * nPitch + ko + li + 8]);
-                    a[1] = pack2(Pq[(gi + 8) * nPitch + ko + li], Pq[(gi + 8) * nPitch + ko + li + 8]);
-                    a[2] = pack2(Pq[gi * nPitch + ko + li + 4],   Pq[gi * nPitch + ko + li + 12]);
-                    a[3] = pack2(Pq[(gi + 8) * nPitch + ko + li + 4], Pq[(gi + 8) * nPitch + ko + li + 12]);
+                    // token-swizzled P: mma A register pair (token j, j+8) at
+                    // (ko+2j, ko+2j+1) — one LDS.32 loads both halves.
+                    a[0] = ld32(&Pq[gi * nPitch + ko + 2 * li]);
+                    a[1] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li]);
+                    a[2] = ld32(&Pq[gi * nPitch + ko + 2 * li + 8]);
+                    a[3] = ld32(&Pq[(gi + 8) * nPitch + ko + 2 * li + 8]);
                     uint32_t bb[2];
                     bb[0] = pack2(Vsm[(ko + li) * kPitch + dg],      Vsm[(ko + li + 8) * kPitch + dg]);
                     bb[1] = pack2(Vsm[(ko + li + 4) * kPitch + dg],  Vsm[(ko + li + 12) * kPitch + dg]);
@@ -373,8 +398,7 @@ void launch_qsa_pass2_tc_reuse(const __nv_bfloat16* q, const __nv_bfloat16* k,
                                  + ((S + 31) / 32) * sizeof(unsigned int)
                                  + S
                                  + sizeof(int)
-                                 + (size_t)UMAX * sizeof(short)
-                                 + UMAX);
+                                 + (size_t)UMAX * sizeof(short));
     long long total_groups = (long long)B * S / M_TILE;
     int nblocks = (int)(total_groups * KVH);
     auto kern = qsa_pass2_tc_reuse_kernel;
