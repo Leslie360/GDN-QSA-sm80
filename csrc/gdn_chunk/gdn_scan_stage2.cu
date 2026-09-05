@@ -20,7 +20,7 @@
 // A-op via copy_A (correct on MMALayout); B-op via load_C + c_to_b (copy_B
 // would silently TRANSPOSE — see gdn-copyb-transpose-trap).
 //
-// Precision matches scan_torch_proto.prefix_scan 'bf16' cfg:
+// Precision matches the torch scan reference prefix_scan 'bf16' cfg:
 //   A = bf16(A2@A1), B = bf16(A2@B1 + B2), fp32 accumulate.
 
 #include <cuda_runtime.h>

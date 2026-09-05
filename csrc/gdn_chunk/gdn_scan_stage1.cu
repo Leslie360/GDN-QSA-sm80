@@ -18,9 +18,9 @@
 //   => A_g, B_g [128,128] each; stored to a global buffer.
 //
 // Precision: A_g/B_g stored bf16, fp32 MMA accumulate, round to bf16 at the
-// end of each chunk combine (matches scan_torch_proto.py 'bf16' config).
+// end of each chunk combine (matches the torch scan reference 'bf16' config).
 //
-// Workspace layout (VERIFIED row-major by scan_torch_proto.py + the prepare
+// Workspace layout (VERIFIED row-major by the torch scan reference + the prepare
 // kernel): ws_kd/ws_kr are logical [CHUNK,D] bf16 row-major tiles, ws_inv
 // [16,16], ws_gt [D] fp32; tile index = bh*chunks_per_seq + t, bh=seq*H+head.
 // v and beta are the raw inputs (not in the workspace) and are read row-major

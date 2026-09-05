@@ -17,7 +17,7 @@
 //   where L = total of left child (x[i+half-1]), P = parent exclusive prefix
 //   (x[i+s-1]). The root x[G-1] is set to identity before the down-sweep.
 //
-// Non-commutative ordering verified against scan_torch_proto in dbg_blelloch.py
+// Non-commutative ordering verified against the scan_torch reference prototype
 // (fp32: matches serial + Hillis-Steele-shifted to ~1e-6; bf16: bf16-rounding).
 //
 // PACKED [A|B] formulation, same as gdn_scan_stage2.cu: each composition is ONE
@@ -27,7 +27,7 @@
 // B-op is loaded via load_C + c_to_b (copy_B would silently TRANSPOSE — see
 // gdn-copyb-transpose-trap). smem/gmem layout identical to gdn_scan_stage2.cu.
 //
-// Precision matches scan_torch_proto 'bf16' cfg: operands bf16, fp32 MMA
+// Precision matches the torch scan reference 'bf16' cfg: operands bf16, fp32 MMA
 // accumulate, round to bf16 at phase boundaries.
 //
 // Tree layout: one array per sequence of G nodes, contiguous like the existing

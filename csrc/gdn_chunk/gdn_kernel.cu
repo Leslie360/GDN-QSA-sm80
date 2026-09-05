@@ -2241,7 +2241,7 @@ extern "C" void gdn_chunk_forward(
 // Stage-3 launcher: parallel group replay (superchunk two-level scan).
 // grid = (B, H, num_groups). Each CTA replays its GROUP_CHUNKS chunk range
 // starting from the group start state in prefix_B (produced by Stage-2 scan).
-// final_state written by the last group only (as in scan_torch_proto replay).
+// final_state written by the last group only (as in the torch scan reference replay).
 extern "C" void gdn_chunk_replay(
     const cutlass::bfloat16_t* v, int v_row_stride,
     const cutlass::bfloat16_t* beta,
