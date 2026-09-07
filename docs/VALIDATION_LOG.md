@@ -3,6 +3,65 @@
 Clean A800 (SM80) build / test / benchmark record for gdn-qsa-sm80. Every README
 benchmark table row traces to a run below.
 
+## Run 6 (2026-09-07) — qsa_core reuse: pair-packed P + in-warp rowsum + fused sm-state
+
+| Field | Value |
+|---|---|
+| date | 2026-09-07 |
+| machine / GPU | cloud **NVIDIA A800-SXM4-80GB** (SM80), 2×A800 host, idle GPU0 |
+| tree state | commit `e769589` (squashes the `dev/pairp` experiment branch onto `c8108b0`) |
+| build command | full `bash scripts/build.sh` (torch 2.13.0+cu130, nvcc 13.0, driver 550 via `cuda-13.0/compat`) |
+| test command | `CUDA_VISIBLE_DEVICES=0 python -m pytest tests/ -q` + `python tools/verify_reuse.py` |
+| correctness | **37/37 PASS** (full suite) + reuse recent/random all-S PASS, relL1 ~1.6e-3 (unchanged) |
+
+### qsa_core `qsa_pass2_tc_reuse` — S=8192 11.50 → 9.23 ms
+
+Kernel-intrinsic `clock64()` segment profiling (no privileged `ncu`/`nsys` on this
+host) drove three structural changes on top of the Run-5 kernel:
+
+1. **P stored as packed token pairs.**  The P phase writes one u32 per
+   `(row, token-PAIR)` — tokens `(16g+m, +8)` with `g=lane/8, m=lane%8` packed
+   into one swizzled slot — halving both the P smem footprint and the store
+   instructions.  S=8192 11.54 → 9.40 ms.
+2. **Rowsum entirely in-warp.**  The `plsum` smem array and its cross-warp reads
+   are dropped; each thread reduces its two rows `{warp, warp+8}` with 5
+   `__shfl` reductions inside the single owning warp.  (Combined with pair
+   packing this is the Exp3 change.)
+3. **Online-softmax state fused into the P phase.**  An `sm_m`/`sm_l` ping-pong
+   double buffer lets the owner thread write the *next* tile's running state
+   with no barrier, eliminating the separate phase-5 (the rescale→P barrier
+   from Run 5 already having gone).  Owners split to lane0/1 per warp with
+   batched independent reads.  S=8192 → **9.23 ms**, 230 regs no spill.
+
+Release-bench row (idle GPU0, `benchmarks/bench_qsa_core.py`, stable across
+repeated runs; scalar/v3 unchanged from Run 5 confirms cross-version consistency):
+
+| S | scalar (ms) | v3 `qsa_pass2_tc` (ms) | reuse `qsa_pass2_tc_reuse` (ms) | v3 vs scalar | reuse vs v3 | reuse vs scalar |
+|---|---|---|---|---|---|---|
+| 512 | 1.37 | 0.35 | 0.35* | 3.91x | 1.00x | 3.91x |
+| 2048 | 14.63 | 3.85 | 1.52 | 3.80x | **2.54x** | 9.64x |
+| 8192 | 91.27 | 25.89 | 9.23 | 3.52x | **2.81x** | **9.89x** |
+
+`*` S=512 still routes to v3 (union-build overhead; dispatch gate unchanged
+`1024 ≤ S ≤ 8192`).  verify_reuse perf line: `S=8192 recent: v3 25.907ms,
+reuse 9.226ms, reuse/v3 0.356`.
+
+**Rejected on this branch (reverted — do not re-explore):**
+- smem `atomicMax` fusion of the phase-3 rowmax (Exp2): 12.25 ms — the float
+  `atomicMax` key-encoding collides on banks worse than the barrier it removed;
+  mixing the encoded key space with the raw-float init also NaNs the output.
+- Warp-ballot union compaction (Exp7): 9.31 ms — slightly worse than the
+  batched-read owner chain it replaced.
+- Hoisting the PV `Vf` B-fragment loads before phase 3 (Exp8): 9.67 ms — the
+  early hoist lengthens the live range and adds register pressure past the win.
+
+qk (~31%) and gather (~23%) are now near the structural floor; the remaining
+documented next lever is a kv-major tile-stationary rewrite or 2 CTA/SM (halve
+smem).  The `clock64` scaffolding and its pybind hooks were removed from the
+shipped kernel (`e769589`).
+
+---
+
 ## Run 4 (2026-09-05) — qsa_core pass2 + gdn_chunk dispatch
 
 | Field | Value |

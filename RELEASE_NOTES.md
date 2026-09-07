@@ -1,8 +1,8 @@
-# Release Notes — gdn-qsa-sm80 v0.2.2
+# Release Notes — gdn-qsa-sm80 v0.2.3
 
-**Date**: 2026-09-06
+**Date**: 2026-09-07
 **GPU**: NVIDIA A800-SXM4-80GB (SM80/Ampere)
-**Build**: CUDA 12.4 / nvcc 12.4, torch 2.6.0+cu124, bf16 tensor cores (`mma.sync.m16n8k16`)
+**Build**: CUDA 13.0 / nvcc 13.0, torch 2.13.0+cu130 (Run 6; CUDA 12.4 / torch 2.6.0+cu124 toolchain also verified), bf16 tensor cores (`mma.sync.m16n8k16`)
 
 From-scratch SM80 CUDA operators for the **Gated DeltaNet + QSA** attention
 family (the public Qwen3.8-Flash-Next architecture). No Triton, no cuDNN; only
@@ -24,14 +24,20 @@ auto-dispatched for `1024 ≤ S ≤ 8192`) vs the per-query TC pass2:
 
 | S | scalar (ms) | TC pass2 v3 (ms) | TC pass2 reuse (ms) | reuse vs v3 | reuse vs scalar |
 |---|---|---|---|---|---|
-| 2048 | 16.38 | 3.85 | 2.09 | 1.85x | 7.85x |
-| 8192 | 91.12 | 25.91 | 11.50 | **2.26x** | **7.93x** |
+| 2048 | 14.63 | 3.85 | 1.52 | 2.54x | 9.64x |
+| 8192 | 91.27 | 25.89 | 9.23 | **2.81x** | **9.89x** |
 
 The reuse kernel groups 4 adjacent queries per CTA, shares each gathered
 64-token K/V tile across them, fuses the softmax P/plsum into one barrier,
 swizzles the Q/K/P smem layouts for single-LDS mma fragments, hoists all
 loop-invariant fragment/token loads out of the per-query loops, and gathers
-16 cols/thread with paired uint32 stores.
+16 cols/thread with paired uint32 stores.  v0.2.3 adds three structural
+changes on top: P is packed as token **pairs** — one u32 per `(row, token-PAIR)`
+halves the P smem footprint and P-store instructions (11.54→9.40ms); the
+rowsum is computed **entirely in-warp** via 5 `__shfl` reductions (the `plsum`
+smem array is dropped); and the online-softmax state update is **fused into
+the P phase** via an `sm_m`/`sm_l` ping-pong double buffer, eliminating the
+separate phase-5 barrier (→9.23ms, 230 regs no spill).
 
 **Other operators** (S=8192): `gdn_chunk` 0.895ms vs fla 1.197ms (1.34x);
 `qsa_indexer` 1.974ms vs vectorized eager 3.371ms (1.71x, all lengths);

@@ -91,7 +91,6 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     const int b  = bs_base / S;
     const int s0 = bs_base % S;
 
-
     // ---- shared memory ----
     extern __shared__ char smem_raw[];
     char* sp = smem_raw;
@@ -111,10 +110,10 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     float* tmax  = part + M_TILE * M16 * 16;                              // [M_TILE][16]
     float* tlsum = tmax + M_TILE * M16;
     sp += (2 * M_TILE * M16 * 8 + 2 * M_TILE * M16) * sizeof(float);
-    float* sm_m = reinterpret_cast<float*>(sp);                           // [M_TILE][16]
-    sp += M_TILE * M16 * sizeof(float);
-    float* sm_l = reinterpret_cast<float*>(sp);                           // [M_TILE][16]
-    sp += M_TILE * M16 * sizeof(float);
+    float* sm_m = reinterpret_cast<float*>(sp);                           // [2][M_TILE][16] ping-pong
+    sp += 2 * M_TILE * M16 * sizeof(float);
+    float* sm_l = reinterpret_cast<float*>(sp);                           // [2][M_TILE][16] ping-pong
+    sp += 2 * M_TILE * M16 * sizeof(float);
     // NOTE: O accumulator lives in REGISTERS (O_r[2][8] per thread) — putting
     // it in smem requires a (warp, gi, li) key (gi=lane/4 repeats across the 8
     // warps), which is what the racecheck failures were about.
@@ -177,7 +176,7 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
     __syncthreads();
 
     // ---- online-softmax state per query (O in registers, 16 f32 per query) ----
-    for (int e = tid; e < M_TILE * M16; e += 256) { sm_m[e] = -1e30f; sm_l[e] = 0.f; }
+    for (int e = tid; e < 2 * M_TILE * M16; e += 256) { sm_m[e] = -1e30f; sm_l[e] = 0.f; }
     float O_r[M_TILE][2][8];
 #pragma unroll
     for (int qq = 0; qq < M_TILE; qq++)
@@ -187,8 +186,13 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             for (int d = 0; d < 8; d++) O_r[qq][rh][d] = 0.f;
     __syncthreads();
     const int n_utiles = (U + N_TILE - 1) / N_TILE;
+    int buf = 0;   // sm_m/sm_l ping-pong parity (flipped after each tile)
     for (int t = 0; t < n_utiles; t++) {
         const int tbase = t * N_TILE;
+        const float* sm_m_c = sm_m + buf * (M_TILE * M16);
+        const float* sm_l_c = sm_l + buf * (M_TILE * M16);
+        float* sm_m_n = sm_m + (buf ^ 1) * (M_TILE * M16);
+        float* sm_l_n = sm_l + (buf ^ 1) * (M_TILE * M16);
 
         // ---- 1) vectorized gather K/V: union_tok[t*64 + row] -> Ksm/Vsm ----
         // Ksm is d-swizzled (swz_d) so QK's mma A/B fragments can LDS.32 whole
@@ -290,77 +294,100 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
         }
         __syncthreads();
 
-        // ---- 3) running max: mnew[r] = max(sm_m[r], tile row max).  One thread
-        //      per row (16 threads).  Storing mnew (not the raw max) lets BOTH the
-        //      rescale and the P phase read a single value, so phases 4+5 fuse.
+        // ---- 3) running max: mnew[r] = max(sm_m[r], tile row max); one thread
+        //      per row (16 threads), 8 pmax reads batched so the max tree overlaps
+        //      load latency.  Storing mnew (not the raw max) lets BOTH the rescale
+        //      and the P phase read a single value, so phases 4+5 fuse.
         if ((tid & 15) == 0) {                       // one thread per row
             const int r = tid >> 4;
             for (int qq = 0; qq < M_TILE; qq++) {
-                float mm = -1e30f;
-                for (int x = 0; x < 8; x++) mm = fmaxf(mm, pmax[qq * (M16 * 8) + r * 8 + x]);
-                tmax[qq * M16 + r] = fmaxf(sm_m[qq * M16 + r], mm);   // now holds mnew
+                const float* pm8 = pmax + qq * (M16 * 8) + r * 8;
+                const float p0 = pm8[0], p1 = pm8[1], p2 = pm8[2], p3 = pm8[3];
+                const float p4 = pm8[4], p5 = pm8[5], p6 = pm8[6], p7 = pm8[7];
+                const float mm = fmaxf(fmaxf(fmaxf(p0, p1), fmaxf(p2, p3)),
+                                       fmaxf(fmaxf(p4, p5), fmaxf(p6, p7)));
+                tmax[qq * M16 + r] = fmaxf(sm_m_c[qq * M16 + r], mm);   // now holds mnew
             }
         }
         __syncthreads();
 
-        // ---- 4) fused online-rescale + P + plsum (ONE barrier).  sm_m is stable
-        //      (only phase 5 updates it); rescale scales O_r with corr, P reads
-        //      mnew (tmax buffer).  Pad rows skip the P store (finalize discards).
-        int ptok[4]; unsigned char pqm[4];
+        // ---- 4) fused online-rescale + P + rowsum (ONE barrier).  P items are
+        // (row, token-PAIR): thread tid handles rows {warp, warp+8} x pair lane
+        // -> tokens (16g+m, +8) with g=lane/8, m=lane%8, packed into ONE u32 at
+        // swizzled slot 16g+2m (slot 2a <-> token a, 2a+1 <-> token a+8).  Each
+        // row's 32 pairs sit in ONE warp -> the rowsum reduces with 5 in-warp
+        // shuffles, NO plsum smem round trip.  Pad rows skip the P store.
+        const int pg    = lane >> 3;               // 16-token group 0..3
+        const int pm    = lane & 7;                // pair slot within group
+        const int plo   = pg * 16 + pm;            // lo token 0..63
+        const int phi   = plo + 8;
+        const int ptok0 = union_tok[tbase + plo];
+        const int ptok1 = union_tok[tbase + phi];
+        const unsigned char pqm0 = (ptok0 >= 0) ? qmap[ptok0] : 0;
+        const unsigned char pqm1 = (ptok1 >= 0) ? qmap[ptok1] : 0;
+        float lsum0[M_TILE], lsum1[M_TILE];
 #pragma unroll
-        for (int it = 0; it < 4; it++) {
-            int e = it * 32 + lane;
-            int m = warp * 8 + (e % 8);
-            ptok[it] = union_tok[tbase + m];
-            pqm[it] = (ptok[it] >= 0) ? qmap[ptok[it]] : 0;
-        }
         for (int qq = 0; qq < M_TILE; qq++) {
-            // rescale O_r (sm_m still pre-tile)
+            // rescale O_r (sm_m still pre-tile) — own rows gi, gi+8
             const int r0 = gi, r1 = gi + 8;
-            float corr0 = __expf(sm_m[qq * M16 + r0] - tmax[qq * M16 + r0]);
+            float corr0 = __expf(sm_m_c[qq * M16 + r0] - tmax[qq * M16 + r0]);
 #pragma unroll
             for (int d = 0; d < 8; d++) O_r[qq][0][d] *= corr0;
-            float corr1 = __expf(sm_m[qq * M16 + r1] - tmax[qq * M16 + r1]);
+            float corr1 = __expf(sm_m_c[qq * M16 + r1] - tmax[qq * M16 + r1]);
 #pragma unroll
             for (int d = 0; d < 8; d++) O_r[qq][1][d] *= corr1;
-            // P + plsum
+            // P (two packed pair stores, rows warp / warp+8) + in-register rowsum
             const int s_qq = s0 + qq;
             const float* Scq = Sc + qq * M16 * nPitch;
             __nv_bfloat16* Pq = P + qq * M16 * nPitch;
+            const float mn0 = tmax[qq * M16 + warp];
+            const float mn1 = tmax[qq * M16 + warp + 8];
+            const bool ok0 = (ptok0 >= 0) && (ptok0 <= s_qq) && (pqm0 & (1u << qq));
+            const bool ok1 = (ptok1 >= 0) && (ptok1 <= s_qq) && (pqm1 & (1u << qq));
+            const float p0 = ok0 ? __expf(Scq[warp * nPitch + plo] - mn0) : 0.f;
+            const float p1 = ok1 ? __expf(Scq[warp * nPitch + phi] - mn0) : 0.f;
+            const float q0 = ok0 ? __expf(Scq[(warp + 8) * nPitch + plo] - mn1) : 0.f;
+            const float q1 = ok1 ? __expf(Scq[(warp + 8) * nPitch + phi] - mn1) : 0.f;
+            if (warp < HBLK)
+                *reinterpret_cast<uint32_t*>(&Pq[warp * nPitch + pg * 16 + 2 * pm]) = pack2(f2b(p0), f2b(p1));
+            if (warp + 8 < HBLK)
+                *reinterpret_cast<uint32_t*>(&Pq[(warp + 8) * nPitch + pg * 16 + 2 * pm]) = pack2(f2b(q0), f2b(q1));
+            float rs0 = b2f(f2b(p0)) + b2f(f2b(p1));   // quantized like PV operands
+            float rs1 = b2f(f2b(q0)) + b2f(f2b(q1));
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 1);
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 2);
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 4);
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 8);
+            rs0 += __shfl_xor_sync(0xffffffffu, rs0, 16);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 1);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 2);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 4);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 8);
+            rs1 += __shfl_xor_sync(0xffffffffu, rs1, 16);
+            lsum0[qq] = rs0;
+            lsum1[qq] = rs1;
+        }
+        // ---- 5) sm_l/sm_m update, fused INTO phase 4 (before its barrier): lanes
+        //      0/1 of each warp own rows {w, w+8} and write the PING-PONG next
+        //      buffer while everyone else still reads the current one — no
+        //      race, no separate phase, no serial-chain exposure.
+        if (lane < 2) {
+            const int r = warp + lane * 8;   // lane0 -> row w, lane1 -> row w+8
+            float mn[M_TILE], smo[M_TILE], slo[M_TILE];
 #pragma unroll
-            for (int it = 0; it < 4; it++) {
-                int e = it * 32 + lane;
-                int r = e / 8; int c = e % 8; int m = warp * 8 + c;
-                bool ok = (m < N_TILE) && (ptok[it] >= 0) && (ptok[it] <= s_qq) && (pqm[it] & (1u << qq));
-                float p = ok ? __expf(Scq[r * nPitch + m] - tmax[qq * M16 + r]) : 0.f;
-                float pb = b2f(f2b(p));   // match PV's bf16 operands exactly
-                if (r < HBLK && m < N_TILE) Pq[r * nPitch + swz_d(m)] = f2b(p);  // skip pad rows
-                float pv = pb;
-                pv += __shfl_xor_sync(0xffffffffu, pv, 1);
-                pv += __shfl_xor_sync(0xffffffffu, pv, 2);
-                pv += __shfl_xor_sync(0xffffffffu, pv, 4);
-                if (c == 0) plsum[qq * (M16 * 8) + r * 8 + warp] = pv;
+            for (int qq = 0; qq < M_TILE; qq++) {
+                mn[qq]  = tmax[qq * M16 + r];
+                smo[qq] = sm_m_c[qq * M16 + r];
+                slo[qq] = sm_l_c[qq * M16 + r];
+            }
+#pragma unroll
+            for (int qq = 0; qq < M_TILE; qq++) {
+                const float corr = __expf(smo[qq] - mn[qq]);
+                sm_l_n[qq * M16 + r] = slo[qq] * corr + (lane == 0 ? lsum0[qq] : lsum1[qq]);
+                sm_m_n[qq * M16 + r] = mn[qq];
             }
         }
         __syncthreads();
-
-        // ---- 5) sm_l + sm_m update (single owner per row).  The owner reads its
-        //      OWN sm_m/sm_l (still pre-tile — not yet written this qq) so no
-        //      barrier is needed before PV (PV reads P, already visible via the
-        //      barrier above; sm_m/sm_l are next read at phase 3 / finalize).
-        for (int qq = 0; qq < M_TILE; qq++)
-#pragma unroll
-            for (int rh = 0; rh < 2; rh++) {
-                const int r = gi + rh * 8;
-                if (tid == (r & 7) * 4) {
-                    const float mnew = tmax[qq * M16 + r];
-                    const float corr = __expf(sm_m[qq * M16 + r] - mnew);
-                    float lt = 0.f;
-                    for (int x = 0; x < 8; x++) lt += plsum[qq * (M16 * 8) + r * 8 + x];
-                    sm_l[qq * M16 + r] = sm_l[qq * M16 + r] * corr + lt;
-                    sm_m[qq * M16 + r] = mnew;
-                }
-            }
 
         // ---- 6) TC PV: all queries, one barrier ----
         // Fragment operands are loop-invariant in a way the compiler cannot
@@ -408,16 +435,18 @@ __global__ void __launch_bounds__(256, 1) qsa_pass2_tc_reuse_kernel(
             }
         }
         __syncthreads();
+        buf ^= 1;
     }
 
     // ---- finalize: thread (gi,li) owns rows gi/gi+8 of each query ----
+    const float* sm_l_f = sm_l + buf * (M_TILE * M16);
     for (int qq = 0; qq < M_TILE; qq++) {
         const int s = s0 + qq;
 #pragma unroll
         for (int rh = 0; rh < 2; rh++) {
             const int r = gi + rh * 8;
             if (r < HBLK) {
-                float inv = 1.f / fmaxf(sm_l[qq * M16 + r], 1e-30f);
+                float inv = 1.f / fmaxf(sm_l_f[qq * M16 + r], 1e-30f);
                 int h = gg * HBLK + r;
                 __nv_bfloat16* o = out + ((long long)b * S + s) * H * D + h * D + warp * 32;
 #pragma unroll

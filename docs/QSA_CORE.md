@@ -23,8 +23,8 @@ all-warp QK, `kPitch=264` to eliminate 8-way bank conflicts, `__launch_bounds__(
 for 2 CTA/SM occupancy, and a distributed online softmax (cells spread across
 lanes + 8-lane `__shfl_xor` reduction) that removed a 32x cross-lane
 redundancy. bf16, `D=256` only. TC pass2 (v3) vs scalar (current bench,
-`benchmarks/bench_qsa_core.py`): S=8192 **91.12ms → 25.91ms (3.52x)**,
-S=2048 16.38ms → 3.85ms (4.25x), S=512 1.39ms → 0.36ms (3.88x).
+`benchmarks/bench_qsa_core.py`): S=8192 **91.27ms → 25.89ms (3.52x)**,
+S=2048 14.63ms → 3.85ms (3.80x), S=512 1.37ms → 0.35ms (3.91x).
 
 **TC pass2 reuse**: groups `M_TILE=4` adjacent queries per CTA, builds the union
 of their selected token sets in shared memory (a `bitmap`+`atomicOr` union, no
@@ -42,8 +42,15 @@ qq-invariant), and (d) gathers 16 cols/thread so swz pairs store as `uint32`.
 Round-2 inner-loop fusion: (e) merges the softmax row-max into the QK pass
 (scores live in registers, no separate smem max pass), and (f) fuses the
 rescale into P via an `mnew` phase, dropping the `sm_l` barrier.
-S=8192 **11.50ms (7.93x over scalar, 2.26x over v3)**, S=2048 2.09ms (7.85x
-over scalar, 1.85x over v3).
+Round-3 structural changes (Run 6): (g) stores P as packed token **pairs**
+`(16g+m, +8)` — one u32 per `(row, token-PAIR)`, halving the P smem slots and
+P-store instructions, (h) computes the rowsum **entirely in-warp** via 5
+`__shfl` reductions (the `plsum` smem array and its cross-warp reads are
+dropped), and (i) merges the online-softmax state update into the P phase via
+an `sm_m`/`sm_l` **ping-pong double buffer** — the separate phase-5 barrier
+vanishes; each phase-3/5 owner is split to lane0/1 with batched reads.
+S=8192 **9.23ms (9.89x over scalar, 2.81x over v3)**, S=2048 1.52ms (9.64x
+over scalar, 2.54x over v3) — down from 11.50ms / 2.09ms.
 Dispatched only when `1024 ≤ S ≤ 8192` and `S % 4 == 0`; below S=1024 the
 union-build overhead does not pay off (S=512 is within noise of v3), so it
 falls back to v3.
