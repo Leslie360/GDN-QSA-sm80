@@ -957,7 +957,7 @@ std::vector<torch::Tensor> forward_gdn_chunk_auto(
         if (S > 512) {
             const double gmean = g.neg().mean().item<double>();
             if (gmean >= 0.55) {
-                auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, 16, 1e-6, 1.0, 1e-2);
+                auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, 32, 1e-6, 1.0, 1e-2);
                 if (!output_final_state) r[1] = torch::Tensor();
                 return {r[0], r[1]};
             }
@@ -969,10 +969,15 @@ std::vector<torch::Tensor> forward_gdn_chunk_auto(
         return forward_gdn_chunk(qq, kk, v, g, beta, output_final_state);
     }
     // Long sequence: reset fast path, exact fallback inside.  GC is swept per S
-    // (A800, g=-rand*2.0): S=8192..16384 -> GC=32 best (shorter per-group replay
-    // chain), S<=4096 and S>16384 -> GC=64 (S=4096: 64=0.67<32=0.69;
-    // S=8192: 32=1.05<64=1.21; S=32768: 64=3.07<32=3.61).
-    const int64_t GC = (S > 4096 && S <= 16384) ? 32 : 64;
+    // (A800, g=-rand*2.0): the replay wants >= ~256 CTAs to fill 108 SMs at
+    // 2 CTA/SM, and shorter per-group chains to cut the serial tail.  Measured
+    // (ours-ms): S=4096: 16=0.63<64=0.66<32=0.68; S=8192: 16=0.89=32<64=1.01;
+    // S=32768: 64=2.91<32=2.99<16=3.18.  -> GC=16 for S<=8192, GC=32 for
+    // S<=16384, GC=64 beyond (S=4096: GC=64 leaves only 128 CTAs = SM underfill).
+    int64_t GC;
+    if (S <= 8192) GC = 16;
+    else if (S <= 16384) GC = 32;
+    else GC = 64;
     auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, GC, 1e-6, 1.0, 1e-2);
     if (!output_final_state) {
         r[1] = torch::Tensor();
@@ -1025,7 +1030,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("eps") = 1e-6, py::arg("frac") = 1.0,
           py::arg("gt_eps") = 1e-2);
     m.def("forward_gdn_chunk_auto", &forward_gdn_chunk_auto,
-          "Production GDN forward: serial (S<=2048) / reset fast path GC=64 (S>2048)",
+          "Production GDN forward: serial (S<=2048) / reset fast path (S>2048)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("g"),
           py::arg("beta"), py::arg("output_final_state") = true);
 }
