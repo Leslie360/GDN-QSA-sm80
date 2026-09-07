@@ -91,6 +91,36 @@ extern "C" void gdn_scan_stage1_reset(
     int T_seq, int H, int B, int chunks_per_seq,
     int GROUP_CHUNKS, cudaStream_t stream);
 
+// FUSED stage 1 reset fast path: same outputs computed from raw k/v/g/beta
+// (in-CTA last-chunk prep + gt metric from raw g; no workspace).
+// Defined in gdn_scan_stage1_reset.cu (extern "C").
+extern "C" void gdn_scan_stage1_reset_fused(
+    const cutlass::bfloat16_t* k_ptr, int qk_row_stride,
+    const cutlass::bfloat16_t* v_ptr, int v_row_stride,
+    const cutlass::bfloat16_t* g_ptr, int g_row_stride,
+    const cutlass::bfloat16_t* beta_ptr, int beta_row_stride,
+    cutlass::bfloat16_t* B_g,
+    float* reset_metric,
+    float scale,
+    int T_seq, int H, int B, int chunks_per_seq,
+    int GROUP_CHUNKS, int head_ratio, cudaStream_t stream);
+
+// FUSED stage 3 group replay (reset fast path only): recomputes the per-chunk
+// workspace tiles in-CTA from raw q/k/g/beta (no workspace reads).
+// Defined in gdn_kernel.cu (extern "C").
+extern "C" void gdn_chunk_replay_fused(
+    const cutlass::bfloat16_t* q, const cutlass::bfloat16_t* k,
+    int qk_row_stride,
+    const cutlass::bfloat16_t* v, int v_row_stride,
+    const cutlass::bfloat16_t* g, int g_row_stride,
+    const cutlass::bfloat16_t* beta,
+    cutlass::bfloat16_t* out,
+    const cutlass::bfloat16_t* prefix_B,
+    cutlass::bfloat16_t* final_state,
+    float scale,
+    int T_seq, int H, int B, int chunks_per_seq,
+    int group_chunks, int head_ratio, cudaStream_t stream);
+
 // Stage 1 (superchunk affine scan): group transfer kernel launcher.
 // Defined in gdn_scan_stage1.cu (extern "C").
 extern "C" void gdn_scan_stage1(
@@ -734,10 +764,12 @@ void stage2_blelloch_scan(torch::Tensor A_g, torch::Tensor B_g, int64_t G) {
     B_g.copy_(scratchB);
 }
 
-// Fused two-level scan (superchunk): prepare -> stage1 -> reset-check ->
-// dispatch (shift | Blelloch | Hillis-Steele) -> stage3 replay, all in ONE
-// call on the current CUDA stream. Only ONE host sync (reading the reset
-// count) — avoids per-stage pybind crossings and per-stage tensor allocation.
+// Fused two-level scan (superchunk): fused reset-check (B_g + metric from raw
+// inputs, no workspace) -> host sync -> shift: fused workspace-free replay
+// | fallback: prepare -> stage1 -> reset-check -> (shift | Blelloch |
+// Hillis-Steele) -> stage3 replay from the workspace.  Only ONE host sync in
+// the common reset path — avoids per-stage pybind crossings and workspace
+// allocation entirely when the decay bound holds.
 // Returns (out, final_state, info_tensor).
 std::vector<torch::Tensor> forward_gdn_chunk_twolevel(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor g,
@@ -772,13 +804,9 @@ std::vector<torch::Tensor> forward_gdn_chunk_twolevel(
     int g_row_stride = B * S;
     const int head_ratio = H / Hk;
 
-    // ---- workspace + reset-path buffers (lazy: A_g/scratch only in fallback) ----
-    auto ws_kd = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
-    auto ws_qd = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
-    auto ws_kr = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
-    auto ws_gt = torch::empty({int64_t(total_tiles) * ws_gt_elems}, opts_f32);
-    auto ws_inv = torch::empty({int64_t(total_tiles) * ws_tile_lm}, opts_bf16);
-    auto ws_mqk = torch::empty({int64_t(total_tiles) * ws_tile_lm}, opts_bf16);
+    // ---- reset-path buffers; the kd/qd/kr/gt/inv/mqk workspace is ONLY
+    //      needed by the exact-scan fallback and is allocated lazily there
+    //      (the reset fast path is fully fused: no prepare, no workspace). ----
     auto B_g = torch::empty({int64_t(total_groups) * D * D}, opts_bf16);
     auto metric = torch::empty({int64_t(total_groups)}, opts_f32);
     auto out = torch::empty({B, S, H, D}, opts_bf16);
@@ -790,35 +818,20 @@ std::vector<torch::Tensor> forward_gdn_chunk_twolevel(
     const auto* vp = reinterpret_cast<const cutlass::bfloat16_t*>(v_c.data_ptr());
     const auto* gp = reinterpret_cast<const cutlass::bfloat16_t*>(g_hm.data_ptr());
     const auto* bp = reinterpret_cast<const cutlass::bfloat16_t*>(beta_hm.data_ptr());
-    auto* kdp = reinterpret_cast<cutlass::bfloat16_t*>(ws_kd.data_ptr());
-    auto* qdp = reinterpret_cast<cutlass::bfloat16_t*>(ws_qd.data_ptr());
-    auto* krp = reinterpret_cast<cutlass::bfloat16_t*>(ws_kr.data_ptr());
-    auto* gtp = reinterpret_cast<float*>(ws_gt.data_ptr());
-    auto* invp = reinterpret_cast<cutlass::bfloat16_t*>(ws_inv.data_ptr());
-    auto* mqkp = reinterpret_cast<cutlass::bfloat16_t*>(ws_mqk.data_ptr());
+    auto* outp = reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr());
+    auto* fsp = reinterpret_cast<cutlass::bfloat16_t*>(final_state.data_ptr());
 
     bool use_shift = false;
     int prefix_exclusive = 0;
     float hcnt = 0.f;
 
-    // ---- 1. prepare ----
-    gdn_chunk_prepare_only(qp, kp, vp, gp, bp, g_row_stride,
-        kdp, qdp, krp, gtp, invp, mqkp,
-        qk_row_stride, v_row_stride, g_row_stride,
-        ws_tile_elems, ws_tile_lm, ws_gt_elems,
-        scale, S, H, B, chunks_per_seq, head_ratio, stream.stream());
-
-    // ---- 2. RESET FAST PATH: B_g-only stage1 + decay-bound metric ----
-    // Computes B_g (bit-identical to full build) + a strict UPPER bound metric
-    // on max_abs(A_g) per group, skipping the ENTIRE A chain.  If every group
-    // has metric < eps, the whole scan is provably reset -> shift directly,
-    // no full A_g build, no scan, no separate reset-check.
-    gdn_scan_stage1_reset(kdp, krp, gtp, invp,
-        vp, H * D, bp, B * S,
+    // ---- 1. FUSED reset fast path: B_g + decay-bound metric computed from
+    //         RAW inputs (in-CTA last-chunk prep, no workspace). ----
+    gdn_scan_stage1_reset_fused(kp, qk_row_stride, vp, v_row_stride,
+        gp, g_row_stride, bp, g_row_stride,
         reinterpret_cast<cutlass::bfloat16_t*>(B_g.data_ptr()),
         reinterpret_cast<float*>(metric.data_ptr()),
-        ws_tile_elems, ws_tile_lm, ws_gt_elems,
-        S, H, B, chunks_per_seq, int(group_chunks), stream.stream());
+        scale, S, H, B, chunks_per_seq, int(group_chunks), head_ratio, stream.stream());
     // read metric to host (single sync), count groups above eps
     {
         std::vector<float> hmetric(total_groups);
@@ -838,14 +851,14 @@ std::vector<torch::Tensor> forward_gdn_chunk_twolevel(
             prefix_exclusive = 0;
             // keep hcnt = n_ge for the info tensor
             hcnt = float(n_ge);
-            // skip to stage3 replay
-            gdn_chunk_replay(vp, H * D, bp,
-                kdp, qdp, krp, gtp, invp, mqkp,
-                reinterpret_cast<cutlass::bfloat16_t*>(out.data_ptr()),
+            // fused replay: recomputes each chunk's tiles in-CTA (no ws reads)
+            gdn_chunk_replay_fused(qp, kp, qk_row_stride, vp, v_row_stride,
+                gp, g_row_stride, bp,
+                outp,
                 reinterpret_cast<const cutlass::bfloat16_t*>(B_g.data_ptr()),
-                reinterpret_cast<cutlass::bfloat16_t*>(final_state.data_ptr()),
-                ws_tile_elems, ws_tile_lm, ws_gt_elems,
-                S, H, B, chunks_per_seq, int(group_chunks), 0, stream.stream());
+                fsp,
+                scale, S, H, B, chunks_per_seq,
+                int(group_chunks), head_ratio, stream.stream());
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             auto info = torch::tensor({double(use_shift), double(prefix_exclusive),
                                        double(hcnt), double(total_groups),
@@ -853,13 +866,31 @@ std::vector<torch::Tensor> forward_gdn_chunk_twolevel(
                                       opts_f32);
             return {out, final_state, info};
         }
-        // else: fall through to full A_g build + exact dispatch
+        // else: fall through to workspace prepare + full A_g build + exact dispatch
         hcnt = float(n_ge);
     }
 
-    // ---- 3. (fallback) full stage1: A_g/B_g + reset check ----
-    // Lazy allocation: exact-scan buffers are only needed when the reset
-    // fast path did NOT hold. (reset path above returned before reaching here)
+    // ---- 2. (fallback) prepare workspace, then full stage1 + exact dispatch ----
+    auto ws_kd = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
+    auto ws_qd = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
+    auto ws_kr = torch::empty({int64_t(total_tiles) * ws_tile_elems}, opts_bf16);
+    auto ws_gt = torch::empty({int64_t(total_tiles) * ws_gt_elems}, opts_f32);
+    auto ws_inv = torch::empty({int64_t(total_tiles) * ws_tile_lm}, opts_bf16);
+    auto ws_mqk = torch::empty({int64_t(total_tiles) * ws_tile_lm}, opts_bf16);
+    auto* kdp = reinterpret_cast<cutlass::bfloat16_t*>(ws_kd.data_ptr());
+    auto* qdp = reinterpret_cast<cutlass::bfloat16_t*>(ws_qd.data_ptr());
+    auto* krp = reinterpret_cast<cutlass::bfloat16_t*>(ws_kr.data_ptr());
+    auto* gtp = reinterpret_cast<float*>(ws_gt.data_ptr());
+    auto* invp = reinterpret_cast<cutlass::bfloat16_t*>(ws_inv.data_ptr());
+    auto* mqkp = reinterpret_cast<cutlass::bfloat16_t*>(ws_mqk.data_ptr());
+
+    gdn_chunk_prepare_only(qp, kp, vp, gp, bp, g_row_stride,
+        kdp, qdp, krp, gtp, invp, mqkp,
+        qk_row_stride, v_row_stride, g_row_stride,
+        ws_tile_elems, ws_tile_lm, ws_gt_elems,
+        scale, S, H, B, chunks_per_seq, head_ratio, stream.stream());
+
+    // ---- 3. (fallback) full stage1 over the prepared workspace ----
     auto A_g = torch::empty({int64_t(total_groups) * D * D}, opts_bf16);
     auto scratchA = torch::empty_like(A_g);
     auto scratchB = torch::empty_like(B_g);
@@ -957,7 +988,7 @@ std::vector<torch::Tensor> forward_gdn_chunk_auto(
         if (S > 512) {
             const double gmean = g.neg().mean().item<double>();
             if (gmean >= 0.55) {
-                auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, 32, 1e-6, 1.0, 1e-2);
+                auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, 8, 1e-6, 1.0, 1e-2);
                 if (!output_final_state) r[1] = torch::Tensor();
                 return {r[0], r[1]};
             }
@@ -968,14 +999,14 @@ std::vector<torch::Tensor> forward_gdn_chunk_auto(
         torch::Tensor kk = (Hk == Hv) ? k : k.repeat_interleave(Hv / Hk, 2);
         return forward_gdn_chunk(qq, kk, v, g, beta, output_final_state);
     }
-    // Long sequence: reset fast path, exact fallback inside.  GC is swept per S
-    // (A800, g=-rand*2.0): the replay wants >= ~256 CTAs to fill 108 SMs at
-    // 2 CTA/SM, and shorter per-group chains to cut the serial tail.  Measured
-    // (ours-ms): S=4096: 16=0.63<64=0.66<32=0.68; S=8192: 16=0.89=32<64=1.01;
-    // S=32768: 64=2.91<32=2.99<16=3.18.  -> GC=16 for S<=8192, GC=32 for
-    // S<=16384, GC=64 beyond (S=4096: GC=64 leaves only 128 CTAs = SM underfill).
+    // Long sequence: reset fast path, exact fallback inside.  GC re-swept
+    // with the fused (workspace-free) path on A800 (g=-rand*2.0, ours-ms):
+    // S=4096: GC=16=0.52<8=0.54<32=0.57; S=8192: GC=32=0.85<16=0.87<64=1.00;
+    // S=32768: GC=64=2.84=32<16=3.07.  -> GC=16 for S<=4096, GC=32 for
+    // S<=16384, GC=64 beyond (the fused replay wants ~256+ CTAs to fill
+    // 108 SMs at 2 CTA/SM, with the shortest per-group chain that achieves it).
     int64_t GC;
-    if (S <= 8192) GC = 16;
+    if (S <= 4096) GC = 16;
     else if (S <= 16384) GC = 32;
     else GC = 64;
     auto r = forward_gdn_chunk_twolevel(q, k, v, g, beta, GC, 1e-6, 1.0, 1e-2);
