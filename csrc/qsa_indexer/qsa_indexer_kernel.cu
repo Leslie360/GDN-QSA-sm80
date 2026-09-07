@@ -418,6 +418,69 @@ __global__ void indexer_score_kernel(
 // histogram/collect scans test `pk != NEG_INF_KEY` to skip invalid candidates.
 #define NEG_INF_KEY ((uint64_t)0x007FFFFFu << 32)
 
+// Warp-shuffle hybrid bitonic sort of P2S elements (P2S = power of 2 <= 512),
+// templated so every network stage unrolls to straight-line code.  Thread t
+// owns the consecutive pair (2t, 2t+1) in registers; exchange stages with
+// distance j <= 32 stay inside the warp (__shfl_xor, zero barriers) and
+// j == 1 is a thread-local compare-swap.  Only the distances 64/128/256 of
+// the k = 128/256/512 merges round-trip through shared memory (bufA/bufB),
+// one __syncthreads per round-trip.  Ping-pong buffers mean no extra barrier
+// separates consecutive rounds: round m's write buffer was round m-2's read
+// buffer and round m-1's write-barrier already drained round m-2's reads.
+// Caller passes the pair pre-loaded (slots >= K_eff must be 0, which sorts
+// below every valid packed key); the sorted pair is returned the same way.
+// Same comparator as the old all-smem network: strict descending by
+// (sortable score, reversed index).
+template <int P2S>
+__device__ __forceinline__ void topk_reg_bitonic_sort(
+    uint64_t& v0, uint64_t& v1, int t, uint64_t* bufA, uint64_t* bufB)
+{
+    const int p = 2 * t;
+    #pragma unroll
+    for (int k = 2; k <= P2S; k <<= 1) {
+        #pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const bool up = ((p & k) == 0);
+            if (j == 1) {
+                // Thread-local pair (p, p+1); this thread holds the lower
+                // position, so it keeps hi iff up: with c = (v0 < v1),
+                // v0' = (c == up) ? v1 : v0 and vice versa.
+                const bool c = (v0 < v1);
+                const bool e = (c == up);
+                uint64_t nv0 = e ? v1 : v0;
+                v1 = e ? v0 : v1;
+                v0 = nv0;
+            } else if (j <= 32) {
+                // Intra-warp exchange with partner thread t ^ (j>>1).  The
+                // lower position keeps hi iff up and the upper iff !up, so
+                // this thread takes the partner's value exactly when
+                // (lower == up): v' = ((v < partner) == sw) ? partner : v.
+                uint64_t p0 = __shfl_xor_sync(0xFFFFFFFFu, v0, j >> 1);
+                uint64_t p1 = __shfl_xor_sync(0xFFFFFFFFu, v1, j >> 1);
+                const bool sw = (((p & j) == 0) == up);
+                v0 = ((v0 < p0) == sw) ? p0 : v0;
+                v1 = ((v1 < p1) == sw) ? p1 : v1;
+            } else {
+                // cross-warp exchange: one barrier per round-trip
+                if (p < P2S) {
+                    bufA[p]     = v0;
+                    bufA[p + 1] = v1;
+                }
+                __syncthreads();
+                uint64_t p0 = 0, p1 = 0;
+                if (p < P2S) {
+                    p0 = bufA[p ^ j];
+                    p1 = bufA[(p + 1) ^ j];
+                }
+                const bool sw = (((p & j) == 0) == up);
+                v0 = ((v0 < p0) == sw) ? p0 : v0;
+                v1 = ((v1 < p1) == sw) ? p1 : v1;
+                uint64_t* tmp = bufA; bufA = bufB; bufB = tmp;
+            }
+        }
+    }
+}
+
 __global__ void indexer_topk_kernel(
     const float* __restrict__ block_scores,   // [B,S,NB]
     int* __restrict__ block_indices,          // [B,S,KB]
@@ -613,46 +676,99 @@ __global__ void indexer_topk_kernel(
             }
         }
 
-        // ---- bitonic sort (descending) of the EXACTLY K_eff winners ----
+        // ---- final sort (descending) of the EXACTLY K_eff winners ----
         int P2s = 1;
         while (P2s < K_eff) P2s <<= 1;
-        for (int i = K_eff + threadIdx.x; i < P2s; i += blockDim.x) {
-            s_out[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
-        }
-        __syncthreads();
-        for (int k = 2; k <= P2s; k <<= 1) {
-            for (int j = k >> 1; j > 0; j >>= 1) {
-                for (int i = threadIdx.x; i < P2s; i += blockDim.x) {
-                    int l = i ^ j;
-                    if (l > i) {
-                        bool up = ((i & k) == 0);
-                        uint64_t a = s_out[i];
-                        uint64_t b = s_out[l];
-                        if ((up && a < b) || (!up && b < a)) {
-                            s_out[i] = b;
-                            s_out[l] = a;
-                        }
+        if (P2s <= 512 && KB <= 512) {
+            // Warp-shuffle hybrid bitonic (see topk_reg_bitonic_sort): the
+            // 6-barrier register/shuffle network replaces the 45-barrier
+            // all-shared-memory bitonic.  Slots >= K_eff are virtual pad
+            // keys (0 sorts below every valid packed key, and
+            // s_out[K_eff, P2s) is uninitialized) carried in registers only
+            // -- positions >= K_eff are rewritten as -1/-inf at the output
+            // anyway, so the smem padding pass is dropped too, and the top
+            // K_eff is written straight from registers (no trailing
+            // barrier).  Templated on P2s so all network stages unroll.
+            const int t = threadIdx.x;
+            const int p = 2 * t;
+            uint64_t v0 = (p < K_eff) ? s_out[p] : (uint64_t)0;
+            uint64_t v1 = (p + 1 < K_eff) ? s_out[p + 1] : (uint64_t)0;
+            switch (P2s) {
+                case 512: topk_reg_bitonic_sort<512>(v0, v1, t, s_pack, s_out); break;
+                case 256: topk_reg_bitonic_sort<256>(v0, v1, t, s_pack, s_out); break;
+                case 128: topk_reg_bitonic_sort<128>(v0, v1, t, s_pack, s_out); break;
+                case 64:  topk_reg_bitonic_sort<64>(v0, v1, t, s_pack, s_out);  break;
+                case 32:  topk_reg_bitonic_sort<32>(v0, v1, t, s_pack, s_out);  break;
+                case 16:  topk_reg_bitonic_sort<16>(v0, v1, t, s_pack, s_out);  break;
+                case 8:   topk_reg_bitonic_sort<8>(v0, v1, t, s_pack, s_out);   break;
+                case 4:   topk_reg_bitonic_sort<4>(v0, v1, t, s_pack, s_out);   break;
+                case 2:   topk_reg_bitonic_sort<2>(v0, v1, t, s_pack, s_out);   break;
+                default: break;   // P2s == 1: single winner, already in v0
+            }
+            // Write the top K_eff straight from registers: thread t owns
+            // positions (2t, 2t+1) of the descending order.
+            int*   inds = block_indices   + (size_t)bq * KB;
+            float* sels = selected_scores + (size_t)bq * KB;
+            #pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                const int pos = p + s;
+                if (pos < KB) {
+                    if (pos < K_eff) {
+                        uint64_t pk = s ? v1 : v0;
+                        uint32_t sb = (uint32_t)(pk >> 32);
+                        uint32_t fb = (sb & 0x80000000u) ? (sb & 0x7FFFFFFFu) : ~sb;
+                        uint32_t ridx = (uint32_t)(pk & 0xFFFFFFFFu);
+                        inds[pos] = (int)(0xFFFFFFFFu - ridx);
+                        sels[pos] = __uint_as_float(fb);
+                    } else {
+                        inds[pos] = -1;
+                        sels[pos] = -CUDART_INF_F;
                     }
                 }
-                __syncthreads();
+            }
+        } else {
+            // Large winner sets (K_eff or KB > 512): keep the exact original
+            // all-shared-memory network.
+            for (int i = K_eff + threadIdx.x; i < P2s; i += blockDim.x) {
+                s_out[i] = ((uint64_t)0x007FFFFFu << 32) | (uint64_t)0;   // -inf pad
+            }
+            __syncthreads();
+            for (int k = 2; k <= P2s; k <<= 1) {
+                for (int j = k >> 1; j > 0; j >>= 1) {
+                    for (int i = threadIdx.x; i < P2s; i += blockDim.x) {
+                        int l = i ^ j;
+                        if (l > i) {
+                            bool up = ((i & k) == 0);
+                            uint64_t a = s_out[i];
+                            uint64_t b = s_out[l];
+                            if ((up && a < b) || (!up && b < a)) {
+                                s_out[i] = b;
+                                s_out[l] = a;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
             }
         }
     }
 
-    // ---- write top K_eff from the descending head of s_out ----
-    int*   inds = block_indices   + (size_t)bq * KB;
-    float* sels = selected_scores + (size_t)bq * KB;
-    for (int j = threadIdx.x; j < KB; j += blockDim.x) {
-        if (j < K_eff) {
-            uint64_t pk = s_out[j];
-            uint32_t sb = (uint32_t)(pk >> 32);
-            uint32_t fb = (sb & 0x80000000u) ? (sb & 0x7FFFFFFFu) : ~sb;
-            uint32_t ridx = (uint32_t)(pk & 0xFFFFFFFFu);
-            inds[j] = (int)(0xFFFFFFFFu - ridx);
-            sels[j] = __uint_as_float(fb);
-        } else {
-            inds[j] = -1;
-            sels[j] = -CUDART_INF_F;
+    if (K_eff == 0 || K_eff > 512 || KB > 512) {
+        // ---- write top K_eff from the descending head of s_out ----
+        int*   inds = block_indices   + (size_t)bq * KB;
+        float* sels = selected_scores + (size_t)bq * KB;
+        for (int j = threadIdx.x; j < KB; j += blockDim.x) {
+            if (j < K_eff) {
+                uint64_t pk = s_out[j];
+                uint32_t sb = (uint32_t)(pk >> 32);
+                uint32_t fb = (sb & 0x80000000u) ? (sb & 0x7FFFFFFFu) : ~sb;
+                uint32_t ridx = (uint32_t)(pk & 0xFFFFFFFFu);
+                inds[j] = (int)(0xFFFFFFFFu - ridx);
+                sels[j] = __uint_as_float(fb);
+            } else {
+                inds[j] = -1;
+                sels[j] = -CUDART_INF_F;
+            }
         }
     }
 }
