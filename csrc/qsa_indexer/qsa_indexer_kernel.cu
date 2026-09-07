@@ -249,6 +249,166 @@ __global__ void indexer_encode_q_kernel(
 #define SCORE_CQ 8
 #define SCORE_CB 32
 
+// ---------------------------------------------------------------------------
+// Kernel C2: score matrix I[B, S, NB] — 2x2 register-blocked variant of
+// Kernel C for long sequences (dispatched when NB >= 256, i.e. S >= 1024 at
+// r=4).  Profiled instruction accounting on A800 showed the per-cell inner
+// loop is dominated by dependent shared-load latency under queueing: each
+// output cell streams a full 128-dim k row through the LSU.  This kernel
+// keeps 256 threads per block but gives every thread FOUR output cells
+// (2 query rows x 2 block columns), so:
+//   - per-cell shared loads drop from 6 to 2.5 per dim-group (each staged
+//     float4 of q/k is reused for 4 cells instead of 1),
+//   - the staged block keys sit in shared as unpadded float4 rows (row
+//     stride D4+1 float4 keeps the per-lane LDS.128 conflict-free) staged
+//     DIRECTLY with cp.async — the old padded-float transpose (LDG + 4x
+//     STS through registers) disappears from the critical path,
+//   - the [16 x 64] tile halves staging redundancy vs [8 x 32] (64 B/cell).
+// Thread mapping: warp = one query-row pair x all 32 column pairs, so the
+// 8 q loads per dim-group stay warp-uniform broadcasts and the 2 k loads
+// hit distinct bank quads (col c maps to quad c%8; pairs (c, c+32)).
+// fp32 math is unchanged (FMA per dim, ReLU per head, rsqrt(D) scale).
+// ---------------------------------------------------------------------------
+#define SCORE2_CQ 16
+#define SCORE2_CB 64
+
+__global__ void __launch_bounds__(SCORE2_CQ* SCORE2_CB / 4)
+    indexer_score_blocked_kernel(
+    const float4* __restrict__ qenc,      // [B,S,Hq,D]  (D/4 float4 per head)
+    const float4* __restrict__ kbar,      // [B,NB,D]
+    float* __restrict__ block_scores,     // [B,S,NB]
+    int B, int S, int Hq, int D, int r, int NB)
+{
+    const int D4 = D / 4;
+    const int HqD4 = Hq * D4;
+    const int KST = D4 + 1;               // k row stride in float4 (bank pad)
+
+    extern __shared__ char smem_raw[];
+    float4* sh_q = reinterpret_cast<float4*>(smem_raw);                        // SCORE2_CQ * HqD4 float4
+    float4* sh_k = reinterpret_cast<float4*>(smem_raw + (size_t)SCORE2_CQ * HqD4 * sizeof(float4)); // SCORE2_CB * KST float4
+
+    int qtile = blockIdx.x;
+    int btile = blockIdx.y;
+    int b     = blockIdx.z;
+    int q0 = qtile * SCORE2_CQ;
+    int b0 = btile * SCORE2_CB;
+
+    // Same causal-tile early exit as Kernel C.
+    if (b0 * r + (r - 1) > q0 + SCORE2_CQ - 1) {
+        for (int i = threadIdx.x; i < SCORE2_CQ * SCORE2_CB; i += blockDim.x) {
+            int lq = i / SCORE2_CB, lc = i % SCORE2_CB;
+            int q = q0 + lq, blk = b0 + lc;
+            if (q < S && blk < NB) block_scores[(size_t)b * S * NB + (size_t)q * NB + blk] = -CUDART_INF_F;
+        }
+        return;
+    }
+
+    // Stage q and k tiles; both are plain row-major float4 copies, so both
+    // go through cp.async (no register round-trip, no scalar STS).
+    {
+        const float4* src = qenc + ((size_t)b * S + q0) * HqD4;
+        for (int i = threadIdx.x; i < SCORE2_CQ * HqD4; i += blockDim.x) {
+            int lq = i / HqD4;
+            if (q0 + lq < S) __pipeline_memcpy_async(&sh_q[i], src + i, sizeof(float4));
+        }
+    }
+    {
+        const float4* src = kbar + ((size_t)b * NB + b0) * D4;
+        for (int i = threadIdx.x; i < SCORE2_CB * D4; i += blockDim.x) {
+            int lb = i / D4;
+            if (b0 + lb < NB)
+                __pipeline_memcpy_async(&sh_k[lb * KST + (i % D4)], src + i, sizeof(float4));
+        }
+    }
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+    __syncthreads();
+
+    int tid = threadIdx.x;          // 0 .. 255
+    int cp = tid % 32;              // column pair: cols cp and cp+32
+    int rp = tid / 32;              // row pair:    rows 2*rp and 2*rp+1
+
+    const float4* k1 = sh_k + (size_t)cp * KST;
+    const float4* k2 = sh_k + (size_t)(cp + 32) * KST;
+
+    if (Hq == 4) {
+        // One accumulator per (row, head): 16 independent FMA chains — the
+        // acc[row][col][head]; one accumulator per (row, col, head) keeps
+        // 16 independent FMA chains in flight — the 4-cell body already
+        // provides the ILP that required 4 accumulators per head in the
+        // single-cell kernel.
+        float acc[2][2][4] = {};
+        const float4* qp[2][4];
+        #pragma unroll
+        for (int row = 0; row < 2; ++row)
+            #pragma unroll
+            for (int h = 0; h < 4; ++h)
+                qp[row][h] = sh_q + (size_t)((2 * rp + row) * 4 + h) * D4;
+        #pragma unroll 8
+        for (int d = 0; d < D4; ++d) {
+            float4 x1 = k1[d], x2 = k2[d];
+            #pragma unroll
+            for (int row = 0; row < 2; ++row) {
+                #pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    float4 u = qp[row][h][d];
+                    acc[row][0][h] += u.x * x1.x; acc[row][0][h] += u.y * x1.y;
+                    acc[row][0][h] += u.z * x1.z; acc[row][0][h] += u.w * x1.w;
+                    acc[row][1][h] += u.x * x2.x; acc[row][1][h] += u.y * x2.y;
+                    acc[row][1][h] += u.z * x2.z; acc[row][1][h] += u.w * x2.w;
+                }
+            }
+        }
+        // Row A -> cols cp and cp+32, then row B.
+        #pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            int q = q0 + 2 * rp + row;
+            #pragma unroll
+            for (int col = 0; col < 2; ++col) {
+                int blk = b0 + cp + col * 32;
+                if (q < S && blk < NB) {
+                    float score = -CUDART_INF_F;
+                    if (blk * r + (r - 1) <= q) {
+                        float s = 0.0f;
+                        #pragma unroll
+                        for (int h = 0; h < 4; ++h) {
+                            float dh = acc[row][col][h];
+                            if (dh > 0.0f) s += dh;   // ReLU per head
+                        }
+                        score = s * rsqrtf_((float)D);
+                    }
+                    block_scores[(size_t)b * S * NB + (size_t)q * NB + blk] = score;
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int row = 0; row < 2; ++row) {
+            int q = q0 + 2 * rp + row;
+            #pragma unroll
+            for (int col = 0; col < 2; ++col) {
+                int blk = b0 + cp + col * 32;
+                if (!(blk * r + (r - 1) <= q) || q >= S || blk >= NB) continue;
+                const float4* kk = col == 0 ? k1 : k2;
+                float acc = 0.0f;
+                for (int h = 0; h < Hq; ++h) {
+                    const float4* qh = sh_q + (size_t)((2 * rp + row) * Hq + h) * D4;
+                    float dot = 0.0f;
+                    #pragma unroll 4
+                    for (int d = 0; d < D4; ++d) {
+                        float4 a = qh[d];
+                        float4 kx = kk[d];
+                        dot += a.x * kx.x + a.y * kx.y + a.z * kx.z + a.w * kx.w;
+                    }
+                    if (dot > 0.0f) acc += dot;   // ReLU
+                }
+                block_scores[(size_t)b * S * NB + (size_t)q * NB + blk] =
+                    acc * rsqrtf_((float)D);
+            }
+        }
+    }
+}
+
 __global__ void indexer_score_kernel(
     const float4* __restrict__ qenc,      // [B,S,Hq,D]  (D/4 float4 per head)
     const float4* __restrict__ kbar,      // [B,NB,D]
@@ -1022,6 +1182,25 @@ std::vector<torch::Tensor> qsa_indexer_forward(
     {
         int D4 = D / 4;
         int HqD4 = Hq * D4;
+        // Long sequences dispatch to the 2x2 register-blocked Kernel C2
+        // (NB >= 256 keeps every k tile full; the S*NB gate keeps small
+        // problems on Kernel C, whose smaller blocks fill the GPU better).
+        bool use_blocked = (NB >= 256) && ((int64_t)S * NB >= (int64_t)512 * 1024);
+        if (use_blocked) {
+            int smem2 = SCORE2_CQ * HqD4 * (int)sizeof(float4)
+                      + SCORE2_CB * (D4 + 1) * (int)sizeof(float4);
+            cudaFuncSetAttribute(indexer_score_blocked_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 smem2);
+            dim3 grid2((S + SCORE2_CQ - 1) / SCORE2_CQ,
+                       (NB + SCORE2_CB - 1) / SCORE2_CB,
+                       B);
+            indexer_score_blocked_kernel<<<grid2, SCORE2_CQ * SCORE2_CB / 4, smem2, stream>>>(
+                reinterpret_cast<const float4*>(qenc.data_ptr<float>()),
+                reinterpret_cast<const float4*>(kbar.data_ptr<float>()),
+                block_scores.data_ptr<float>(),
+                B, S, Hq, D, (int)r, NB);
+        } else {
         int smem_bytes = SCORE_CQ * HqD4 * (int)sizeof(float4)
                        + SCORE_CB * (D + 2) * (int)sizeof(float);
         // Larger query tiles can push past the 48KB default; opt in (A800 max 164KB).
@@ -1038,6 +1217,7 @@ std::vector<torch::Tensor> qsa_indexer_forward(
             reinterpret_cast<const float4*>(kbar.data_ptr<float>()),
             block_scores.data_ptr<float>(),
             B, S, Hq, D, (int)r, NB);
+        }
     CHECK_LAUNCH("score");
     }
 
