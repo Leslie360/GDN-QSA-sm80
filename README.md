@@ -195,18 +195,25 @@ for `qsa_indexer`. Full methodology:
 
 | S | ours (ms) | fla (ms) | speedup |
 |---|---|---|---|
-| 2048 | 0.464 | 0.675 | 1.45x |
-| 4096 | 0.566 | 0.676 | 1.19x |
-| 8192 | 0.895 | 1.197 | 1.34x |
-| 32768 | 2.910 | 4.702 | 1.62x |
+| 2048 | 0.439 | 0.508 | 1.16x |
+| 4096 | 0.598 | 0.641 | 1.07x |
+| 8192 | 1.012 | 1.205 | 1.19x |
+| 32768 | 3.221 | 4.190 | 1.30x |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 `gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by decay
-strength and sequence length, and the superchunk group size is swept per `S`
-(the serial per-group replay chain shortens with smaller groups while the
-cross-group scan amortizes over larger ones): `GC=32` for the `8192..16384`
-band, `GC=64` elsewhere.  At `S=8192` this is `1.013→0.895ms` (1.18x→1.34x).
+strength and sequence length.  The reset fast path is workspace-free: the
+per-group gt metric and last-chunk `B_g` are recomputed in-CTA from raw
+k/v/g/beta (fused stage-1), and each replay CTA recomputes its chunks'
+`kd/qd/kr/INV/Mqk` in-CTA from raw q/k/g/beta (fused stage-3, bit-identical
+math to the prepare kernel), so the ~216MB prepare workspace is only
+allocated by the exact-scan fallback.  The superchunk group size is swept
+per `S` (the serial per-group replay chain shortens with smaller groups
+while the cross-group scan amortizes over larger ones): `GC=8` in the
+`S<=2048` reset band, `GC=16` for `S<=4096`, `GC=32` for the `8192..16384`
+band, `GC=64` beyond.  At `S=4096` the fusion is `0.63->0.52ms`, at
+`S=8192` `0.89->0.85ms` (A800, twolevel sweep, g=-rand*2.0).
 
 ### qsa_indexer (vs vectorized eager, fp32, Hq=4/D=128/R=64/r=4/KB=512)
 
