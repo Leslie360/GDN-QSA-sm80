@@ -51,7 +51,17 @@ group replay produces `out` and `final_state`.
 - `S <= 512`: serial recurrence (sync/launch overhead not amortized by scan).
 - `512 < S <= 2048`: reset fast path when `mean(-g) >= 0.55` (strong decay makes
   reset replay win over serial), else serial.
-- `S > 2048`: two-level reset fast path, `GC=64`.
+- `S > 2048`: two-level reset fast path with a fine per-`S` GC table
+  (`GC=16` for `S<=4096`, `GC=32` for `S<=16384`, `GC=64` beyond — the fused
+  replay wants ~256+ CTAs to fill 108 SMs at 2 CTA/SM).
+
+The reset fast path is **workspace-free**: per-group `gt` + last-chunk `B_g`
+are recomputed in-CTA from raw k/v/g/beta (fused stage-1) and each replay CTA
+recomputes its chunks' `kd/qd/kr/INV/Mqk` in-CTA (fused stage-3, bit-identical
+to prepare) — the ~216MB prepare workspace is only allocated by the exact-scan
+fallback, so peak memory ~halves.  The replay state is register-persistent
+(each warp owns its 16-col state blocks, per-chunk serial mma latency scales as
+1/kWarps, all 8 warps in the MMA phases).
 
 Correctness is never at risk: the two-level path internally falls back to the
 exact scan when reset does not hold.
@@ -72,13 +82,15 @@ exact scan when reset does not hold.
 
 `python benchmarks/bench_gdn_chunk.py` — same input, same dtype, fla baseline
 given pre-expanded 32-head Q/K (no repeat-trap), same GPU, warmup + median.
+Baseline is **fla 0.5.2** (older fla baselines in this repo's earlier runs were
+~13% slower, so ratios are only comparable within the same fla version).
 
-| S | ours (ms) | fla (ms) | speedup |
-|---|---|---|---|
-| 2048 | 0.464 | 0.675 | 1.45x |
-| 4096 | 0.566 | 0.676 | 1.19x |
-| 8192 | 0.895 | 1.197 | 1.34x |
-| 32768 | 2.910 | 4.702 | 1.62x |
+| S | ours (ms) | fla (ms) | speedup | peak mem (ours, MB) |
+|---|---|---|---|---|
+| 2048 | 0.423 | 0.500 | 1.18x | 102.2 |
+| 4096 | 0.561 | 0.640 | 1.14x | 186.6 |
+| 8192 | 0.950 | 1.205 | **1.27x** | 355.5 (582 before) |
+| 32768 | 3.187 | 4.189 | 1.31x (1.31–1.55 across sessions) | 1385.2 (2291 before) |
 
 ## Reproduce
 
