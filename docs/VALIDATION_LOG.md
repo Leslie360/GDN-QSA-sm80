@@ -3,6 +3,95 @@
 Clean A800 (SM80) build / test / benchmark record for gdn-qsa-sm80. Every README
 benchmark table row traces to a run below.
 
+## Run 7 (2026-09-08) — qsa_indexer topk/score + gdn_chunk workspace-free reset & 8-warp replay
+
+| Field | Value |
+|---|---|
+| date | 2026-09-08 |
+| machine / GPU | cloud **NVIDIA A800-SXM4-80GB** (SM80), 2×A800 host, idle GPU0 |
+| tree state | master HEAD `2c515be` (merges `0449240` topk-sort + `3d23842` score-2x2 + `ff26acc` gdn GC/workspace-free + `2c515be` 8-warp replay) |
+| build command | full `bash scripts/build.sh` (torch 2.13.0+cu130, nvcc 13.0, driver 550 via `cuda-13.0/compat`) |
+| test command | `CUDA_VISIBLE_DEVICES=0 python -m pytest tests/ -q` |
+| correctness | **37/37 PASS** |
+
+### qsa_indexer — warp-shuffle hybrid bitonic + 2×2 register-blocked score
+
+Two long-sequence bottlenecks closed (`8cf8508` + `5f160ce`):
+
+1. **Final winner sort: all-smem bitonic → warp-shuffle hybrid network.**  The
+   `topk` kernel's final ordering of the `K` winners was a 45-stage block bitonic
+   with one `__syncthreads` per stage.  The new network (templated on `P2s` so it
+   unrolls to straight-line code) keeps consecutive pairs `(2t, 2t+1)` in
+   registers, runs every `j<=32` exchange as `__shfl_xor` (zero barriers; `j==1`
+   is a thread-local compare-swap), and round-trips only the `64/128/256`
+   distances of the `k=128/256/512` merges through shared memory — ping-ponging
+   the now-free `s_pack` slab and `s_out`, 6 barriers instead of 45.  The
+   compare-exchange reduces to one 64-bit compare + one predicate; pad slots
+   beyond `K_eff` are virtual keys carried in registers (padding pass dropped).
+   `topk` S=8192 **0.79 → 0.49 ms**.
+2. **Score kernel C2: 2×2 register-blocked variant.**  256 threads per block but
+   every thread owns FOUR output cells (2 query rows × 2 block columns), so the
+   staged block keys sit in shared as unpadded `float4` rows (`SCORE2_CQ=16`,
+   `SCORE2_CB=64`, the `[16×64]` tile halves staging redundancy vs `[8×32]`, 64
+   B/cell), and both q and k stage through `cp.async`.  Long sequences dispatch
+   to C2 (`NB>=256 && S*NB >= 512*1024` keeps every k tile full); short problems
+   stay on Kernel C.  `score` S=8192 **1.13 → 0.85 ms**.
+
+**qsa_indexer vs vectorized eager** (fp32, Hq=4/D=128/R=64/r=4/KB=512;
+release row = master re-measure, median of N; cross-session clock drift moves
+the absolute ms by ~±20%, so quote the ratios — see BENCHMARK_METHODOLOGY):
+
+| S | ours (ms) | eager (ms) | speedup |
+|---|---|---|---|
+| 512 | 0.034 | ~0.93 | **27.6×** |
+| 2048 | 0.148 | ~0.93 | **6.3×** |
+| 8192 | 1.126 | 3.373 | **3.0×** |
+
+### gdn_chunk — workspace-free fused reset + 8-warp register-persistent replay
+
+Two structural changes on top of the two-level scan (`7134d29`+`740dfcd`+`c6a78a6`):
+
+1. **Workspace-free fused reset fast path.**  The prepare → stage1 → replay
+   workspace round trip (~216 MB write + read) is eliminated on the reset path:
+   a fused stage1-reset recomputes the per-group `gt` metric + last-chunk `B_g`
+   in-CTA from raw k/v/g/beta, and a fused replay recomputes each chunk's
+   `kd/qd/kr/INV/Mqk` in-CTA (`gdn_prep_tile`, bit-identical to prepare), with
+   raw q/k/v/g/beta double-buffered via `cp.async`.  Workspace tensors are lazy
+   (allocated only by the exact-scan fallback, which keeps the legacy path).
+   Peak memory **~halves** on the reset path (S=8192 582→356 MB, S=32768
+   2291→1385 MB).  GC re-swept: `GC=16` for `S<=4096`, `GC=32` for `S<=16384`,
+   `GC=64` beyond.
+2. **8-warp mma + register-persistent replay state.**  The serial per-chunk
+   replay state now lives entirely in per-warp registers (`s_reg`) across the
+   whole group — each warp owns `kCPW` 16-col state blocks, so the per-chunk
+   serial mma latency scales as 1/kWarps; `state_acc` smem is only the
+   `g>0` gmem→smem staging buffer (loaded once, stored back once).  All 8 warps
+   join the MMA phases (`kWarps` instead of 4 of 4).  S=8192 **1.01 → 0.95 ms**.
+
+**gdn_chunk vs fla 0.5.2** (bf16, Hk=16/Hv=32/D=128; fla baseline upgraded to
+0.5.2 — the README/older-run fla baselines were ~13% slower, so ratios are only
+comparable within the same fla version):
+
+| S | ours (ms) | fla (ms) | speedup | peak mem (ours, MB) |
+|---|---|---|---|---|
+| 2048 | 0.423 | 0.500 | 1.18× | 102.2 |
+| 4096 | 0.561 | 0.640 | 1.14× | 186.6 |
+| 8192 | 0.950 | 1.205 | **1.27×** | 355.5 (582 before) |
+| 32768 | 3.187 | 4.189 | **1.31×** (1.31–1.55 across sessions) | 1385.2 (2291 before) |
+
+**Rejected on this branch (reverted / not taken — do not re-explore):**
+- qsa_indexer 2-row register blocking on the old (pre-C2) score kernel: zero net
+  gain (occupancy offsets the reuse); `SCORE_CQ=16` on the old kernel regressed
+  S=512.  The winning C2 blocks 2×2 on the *new* tiled kernel only.
+- `cudaFuncAttributePreferredSharedMemoryCarveout=100` on the topk launch: no
+  effect (occupancy is already smem-limited at ~4 blocks/SM).
+- gdn_chunk prep/mma overlap via a cooked double buffer: needs +13 KB smem →
+  1 CTA/SM → net-negative.  The `colsplit` kernel stays un-wired in auto
+  dispatch (available as `forward_gdn_chunk_colsplit`); `bar.sync 8` removal
+  untested.
+
+---
+
 ## Run 6 (2026-09-07) — qsa_core reuse: pair-packed P + in-warp rowsum + fused sm-state
 
 | Field | Value |

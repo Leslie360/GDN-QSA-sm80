@@ -21,11 +21,18 @@ kernels and reproducible benchmarks against public baselines.
 >
 > **Validation**: clean-A800 build / test / benchmark record in [`docs/VALIDATION_LOG.md`](docs/VALIDATION_LOG.md) (37/37 tests PASS).
 >
-> **v0.2.3**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — qsa_core reuse path at
-> S=8192 is 9.23ms (2.81x over the TC pass2, 9.89x over scalar).
+> **v0.2.4**: see [`RELEASE_NOTES.md`](RELEASE_NOTES.md) — `qsa_indexer` 3.0×
+> vs eager at S=8192, `gdn_chunk` 1.27× vs fla at S=8192 with peak memory
+> halved; `qsa_core` reuse path unchanged at S=8192 9.23ms (2.81× TC pass2, 9.89× scalar).
 
 ## News
 
+- **2026.09.08 · v0.2.4** — perf release: `qsa_indexer` warp-shuffle hybrid
+  bitonic final sort (45 barriers → 6; topk S=8192 0.79→0.49ms) + a 2×2
+  register-blocked long-sequence score kernel (score 1.13→0.85ms) → **3.0×**
+  vs vectorized eager at S=8192 (27.6× at S=512, 6.3× at S=2048); `gdn_chunk`
+  workspace-free fused reset (peak memory **~halved**: S=8192 582→356 MB) and
+  8-warp mma register-persistent replay → **1.27×** vs fla 0.5.2 at S=8192.
 - **2026.09.07 · v0.2.3** — perf release: `qsa_core` reuse kernel pair-packed P (one u32 per token pair, half the smem slots/stores), in-warp rowsum (5 `__shfl` reductions, `plsum` array dropped), and online-softmax state fused into the P phase via an `sm_m`/`sm_l` ping-pong double buffer — S=8192 11.50→**9.23ms**, now **2.81×** over the per-query TC pass-2 and **9.89×** over scalar.
 - **2026.09.06 · v0.2.2** — perf release: `qsa_core` reuse kernel inner-loop fusion — row-max merged into QK (register scores) and rescale fused into P (drops the `sm_l` barrier) — S=8192 12.88→**11.50ms**, now **2.26×** over the per-query TC pass-2 and **7.93×** over scalar.
 - **2026.09.06 · v0.2.1** — perf release: `qsa_core` reuse kernel round-2 optimizations (loop-invariant fragment/token hoists, mma-fragment smem swizzle, 16-col uint32 gathers) — S=8192 20.85→12.88ms, now **2.01×** over the per-query TC pass-2 and **7.07×** over scalar; added `RELEASE_NOTES.md`.
@@ -46,7 +53,7 @@ Deliberately **out of scope** for this repo:
 
 ## Highlights
 
-- **gdn_chunk up to 1.62× vs fla** (S=32K, bf16, A800); **qsa_indexer 1.71× vs vectorized eager at S=8192** (19× at S=512); **qsa_core TC pass-2 3.52× vs scalar, reuse path 9.89×** — full reproduce commands in [Benchmarks](#benchmarks).
+- **gdn_chunk up to 1.44× vs fla 0.5.2** (1.27× at S=8192, peak memory ~halved); **qsa_indexer 3.0× vs vectorized eager at S=8192** (27.6× at S=512, 6.3× at S=2048); **qsa_core TC pass-2 3.52× vs scalar, reuse path 9.89×** — full reproduce commands in [Benchmarks](#benchmarks).
 - **From-scratch SM80 CUDA/CUTE** kernels (not Triton wrappers).
 - Tensor-core kernels via `mma.sync` + `cp.async`, tuned for A800.
 - **Fair, reproducible benchmarks** vs public baselines (fla) — see [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
@@ -58,7 +65,7 @@ Deliberately **out of scope** for this repo:
 | Operator | Component | Target | Dtypes | Notes |
 |---|---|---|---|---|
 | `gdn_chunk` | Gated DeltaNet (linear attention) | SM80 (A100/A800) | bf16 | serial / reset-fast-path / two-level scan, auto-dispatch by S |
-| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | SM80 | fp32 | two-stage path beats vectorized eager at all S (see [Benchmarks](#benchmarks)) |
+| `qsa_indexer` | QSA indexer (MQA 4Q/1K) | SM80 | fp32 | two-stage path: 3.0× vs vectorized eager at S=8192, 27.6× at S=512 (see [Benchmarks](#benchmarks)) |
 | `output_gate` | Gated residual output gate | SM80 | bf16 | RMSNormGated + CUTLASS GEMM |
 | `qsa_core` | QSA sparse-block attention | SM80 | scalar: all / TC: bf16 | TC pass-2 requires D=256 |
 
@@ -131,7 +138,8 @@ out, final_state = gdn_chunk(q, k, v, g, beta, output_final_state=True)
 # out: [B, S, Hv, D]    final_state: [B, Hv, D, D]
 ```
 
-`gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by `S`.
+`gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by decay
+strength and `S`; the reset fast path is workspace-free (peak memory ~halved).
 See [`docs/GDN_CHUNK.md`](docs/GDN_CHUNK.md).
 
 ### QSA indexer — `qsa_indexer` / `qsa_indexer_topk_only`
@@ -191,43 +199,48 @@ median. Baselines: fla for `gdn_chunk`; vectorized eager with identical math
 for `qsa_indexer`. Full methodology:
 [`docs/BENCHMARK_METHODOLOGY.md`](docs/BENCHMARK_METHODOLOGY.md).
 
-### gdn_chunk (vs fla, bf16, Hk=16/Hv=32/D=128)
+### gdn_chunk (vs fla 0.5.2, bf16, Hk=16/Hv=32/D=128)
 
-| S | ours (ms) | fla (ms) | speedup |
-|---|---|---|---|
-| 2048 | 0.439 | 0.508 | 1.16x |
-| 4096 | 0.598 | 0.641 | 1.07x |
-| 8192 | 1.012 | 1.205 | 1.19x |
-| 32768 | 3.221 | 4.190 | 1.30x |
+| S | ours (ms) | fla (ms) | speedup | peak mem (ours, MB) |
+|---|---|---|---|---|
+| 2048 | 0.423 | 0.500 | 1.18x | 102.2 |
+| 4096 | 0.561 | 0.640 | 1.14x | 186.6 |
+| 8192 | 0.950 | 1.205 | **1.27x** | 355.5 (582 before) |
+| 32768 | 3.187 | 4.189 | 1.31x (1.31–1.55 across sessions) | 1385.2 (2291 before) |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_gdn_chunk.py`
 
 `gdn_chunk` auto-dispatches serial / reset-fast-path / two-level scan by decay
-strength and sequence length.  The reset fast path is workspace-free: the
+strength and sequence length.  The reset fast path is **workspace-free**: the
 per-group gt metric and last-chunk `B_g` are recomputed in-CTA from raw
 k/v/g/beta (fused stage-1), and each replay CTA recomputes its chunks'
 `kd/qd/kr/INV/Mqk` in-CTA from raw q/k/g/beta (fused stage-3, bit-identical
 math to the prepare kernel), so the ~216MB prepare workspace is only
-allocated by the exact-scan fallback.  The superchunk group size is swept
-per `S` (the serial per-group replay chain shortens with smaller groups
-while the cross-group scan amortizes over larger ones): `GC=8` in the
-`S<=2048` reset band, `GC=16` for `S<=4096`, `GC=32` for the `8192..16384`
-band, `GC=64` beyond.  At `S=4096` the fusion is `0.63->0.52ms`, at
-`S=8192` `0.89->0.85ms` (A800, twolevel sweep, g=-rand*2.0).
+allocated by the exact-scan fallback — peak memory **~halves** on the reset
+path (S=8192 582→356 MB, S=32768 2291→1385 MB).  The replay state is now
+**register-persistent**: each warp owns its 16-col state blocks across the
+whole group (per-chunk serial mma latency scales as 1/kWarps) and all 8 warps
+join the MMA phases.  The superchunk group size is swept per `S` (the serial
+per-group replay chain shortens with smaller groups while the cross-group scan
+amortizes over larger ones): `GC=8` in the `S<=2048` reset band, `GC=16` for
+`S<=4096`, `GC=32` for the `8192..16384` band, `GC=64` beyond (A800 sweep,
+g=-rand*2.0).
 
 ### qsa_indexer (vs vectorized eager, fp32, Hq=4/D=128/R=64/r=4/KB=512)
 
 | S | ours (ms) | eager (ms) | speedup |
 |---|---|---|---|
-| 512 | 0.046 | 0.875 | 19.0x |
-| 2048 | 0.260 | 0.882 | 3.39x |
-| 8192 | 1.974 | 3.371 | 1.71x |
+| 512 | 0.034 | ~0.93 | **27.6x** |
+| 2048 | 0.148 | ~0.93 | **6.3x** |
+| 8192 | 1.126 | 3.373 | **3.0x** |
 
 Reproduce: `CUDA_VISIBLE_DEVICES=0 python benchmarks/bench_qsa_indexer.py`
 
 The two-stage path (pool → encode → tiled score → per-query TopK) beats the
-vectorized eager baseline at every length, including `S=8192` (`1.71x`).  The
-wins come from SM80-scalar work-splitting and sorting:
+vectorized eager baseline at every length, including `S=8192` (`3.0x`; the
+absolute `ours` ms drift ~±20% across sessions on shared A800 infra, so quote
+the ratios — see `docs/BENCHMARK_METHODOLOGY.md`).  The wins come from
+SM80-scalar work-splitting and sorting:
 
 - **Coalesced preprocess kernels.** The pool-keys and encode kernels each run
   one warp per (batch·block / batch·query·head) row, so every lane owns one
@@ -246,9 +259,18 @@ wins come from SM80-scalar work-splitting and sorting:
   narrowed one byte at a time (CUB `block_topk_air` style) instead of a full
   `O(eq_n log² eq_n)` bitonic sort; once it fits one warp it is sorted in
   registers with warp-shuffle bitonic.  The exact `K` winners are then ordered
-  by a bitonic sort of only `~K` elements.  Candidates are packed to fixed
+  by a warp-shuffle **hybrid bitonic** network — consecutive pairs live in
+  registers, every `j<=32` exchange is a `__shfl_xor`, and only the
+  `64/128/256` distances of the k-merges round-trip through shared memory
+  (6 barriers instead of the previous 45).  Candidates are packed to fixed
   positions (no single-counter `atomicAdd` contention), and `P`/`K_eff` come
   from a thread-0 pivot walk.
+- **Score kernel: 2×2 register-blocked variant for long sequences.** 256
+  threads but four output cells each (2 query rows × 2 block columns); the
+  staged block keys stay in shared as unpadded `float4` rows and both q and k
+  stage via `cp.async` (`SCORE2_CQ=16`/`SCORE2_CB=64`, 64 B/cell).  Dispatched
+  when `NB>=256 && S*NB>=512·1024` so every k tile stays full; short problems
+  keep the `SCORE_CQ=8` kernel.
 
 A fused topK-only variant (`qsa_indexer_topk_only`) skips materializing the
 dense `[S,NB]` score matrix entirely (lower peak memory, no 64MB write/read at
@@ -290,9 +312,10 @@ All tables are from the clean-A800 `bash scripts/bench_all.sh` run logged in
 ## Roadmap
 
 - `qsa_indexer` now beats the vectorized eager baseline at all lengths, including
-  `S=8192` (1.71x), via coalesced preprocess kernels, a narrowing radix-select
-  TopK, and cross-query block-key reuse in the score kernel. Further gains would
-  come from a fused score+radix kernel (single pass, no dense `[S,NB]`
+  `S=8192` (3.0x), via coalesced preprocess kernels, a narrowing radix-select
+  TopK with a warp-shuffle hybrid bitonic final sort, cross-query block-key
+  reuse, and a 2×2 register-blocked long-sequence score kernel. Further gains
+  would come from a fused score+radix kernel (single pass, no dense `[S,NB]`
   materialization) and tensor-core score with fp32-emulation precision.
 - `qsa_core` TC pass-2 is a 3.52x win over scalar (S=8192 25.89ms). A query-tile
   local K/V reuse kernel (`qsa_pass2_tc_reuse`) is shipped for 1024≤S≤8192: it
